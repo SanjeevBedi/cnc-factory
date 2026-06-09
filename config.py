@@ -49,43 +49,40 @@ PYOCC_CONDA_ENV: str = "pyocc"
 SEED_CREATION_PROB: float = 0.002 / 100   # 2e-5  (×10 vs previous 2e-6)
 
 # Duration of one scheduler tick (seconds)
-T_UNIT_SECONDS: int = 60
+T_UNIT_SECONDS: int = 1   # 1 simulated second per scheduler tick
 
-# ── Simulation time base ────────────────────────────────────────────────────
-# One sim-step = one G-code line animated.
-# Each G-code line has its own physical duration:
+# ── Simulation loop — three counters ──────────────────────────────────────────
+# Each loop iteration advances SIM_TICK_S simulated seconds.
+# Wall-clock sleep per iteration = SIM_TICK_S / SIM_COMPRESSION  (at 1x speed).
+# Speed slider scales the sleep: wall_sleep = SIM_TICK_S / (SIM_COMPRESSION x speed)
 #
-#   dt_sim  = distance(current, next) / feedrate   [simulated seconds]
-#   dt_wall = dt_sim / SIM_COMPRESSION              [wall-clock seconds]
+# Three counters, all driven by the same tick:
 #
-# SIM_COMPRESSION = SHIFT_S / SIM_TARGET_WALL_S = 28800 / 180 = 160
-# i.e. 1 simulated second plays out in 1/160 = 6.25 ms wall time at 1×.
+#  1. SCHEDULER  -- fa.tick() called every iteration (T_UNIT_SECONDS = 1)
+#     remaining_s decrements by 1 per tick; job completes after ~T_avg ticks.
 #
-# There is NO fixed SIM_DT_S -- each line sleeps for its own dt_wall.
-# SIM_MIN_STEP_S caps the minimum sleep (prevents spinning on zero-length
-# lines such as comments, tool changes, G90/G21 setup lines).
-# GUI repaint is decoupled: every SIM_GUI_PERIOD_S wall-seconds.
-SIM_COMPRESSION:  float = 160.0    # simulated seconds per wall-clock second
-SIM_MIN_STEP_S:   float = 0.001    # minimum wall sleep per step (1 ms)
-SIM_GUI_PERIOD_S: float = 0.05     # GUI repaint interval in wall-seconds (~20 fps)
-SIM_GUI_MAX_FPS:  int   = 30       # hard cap on GUI repaint rate
+#  2. GUI counter -- accumulates simulated seconds; resets after SIM_GUI_INTERVAL_S.
+#     Dialog boxes refreshed each reset.
+#
+#  3. SEED counter -- accumulates simulated seconds; resets after SIM_SEED_INTERVAL_S.
+#     SIM_SEED_INTERVAL_S = SHIFT_S / parts_per_shift = 28800 / 355 = 81.1 s
+#     ensures exactly 355 seeds are offered per shift.
+#
+# Compression ratio: SHIFT_S / SIM_TARGET_WALL_S = 28800 / 180 = 160x
+SIM_TICK_S:           float = 1.0     # simulated seconds advanced per loop iteration
+SIM_TARGET_WALL_S:    float = 180.0   # wall-clock seconds for one full shift at 1x
+SIM_COMPRESSION:      float = 160.0   # = SHIFT_S / SIM_TARGET_WALL_S
+SIM_GUI_INTERVAL_S:   float = 5.0     # refresh GUI every 5 simulated seconds
+SIM_SEED_INTERVAL_S:  float = 81.1    # = 28800 / 355  seed offer interval (sim-s)
+SIM_GUI_MAX_FPS:      int   = 30      # hard cap on GUI repaint rate (wall clock)
 
-# ── Seed generation probability ──────────────────────────────────────────────
-# Steps are variable duration (dist/feedrate per line), so probability
-# is expressed per simulated second and scaled by each step’s dt_sim:
-#
-#   lambda  = N_MACHINES / T_avg          [seeds per simulated second]
-#   p_step  = lambda × dt_sim             [probability for this step]
-#           = N_MACHINES × dt_sim / T_avg
-#
-# Where dt_sim = distance / feedrate for the current G-code line.
-# For non-cutting steps (setup lines, unclamp ticks) a nominal dt is used.
-#
+# ── Seed generation ───────────────────────────────────────────────────
+# Every SIM_SEED_INTERVAL_S simulated seconds the loop offers one seed.
+# SIM_SEED_INTERVAL_S = SHIFT_S / parts_per_shift = 28800 / 355 = 81.1 s
 # Safety cap: skip if scheduler queue >= SIM_MAX_QUEUE_AHEAD jobs.
 SIM_T_AVG_S:          float = 324.5   # measured mean machining time (s), cm→mm
 SIM_SHIFT_HOURS:      float = 8.0     # shift length (hours)
 SIM_N_MACHINES:       int   = 4       # number of CNC machines
-SIM_TARGET_WALL_S:    float = 180.0   # wall-clock seconds for one full shift
 SIM_MAX_QUEUE_AHEAD:  int   = 8       # safety cap on scheduler queue depth
 
 # ── Feature Extractor ─────────────────────────────────────────────────────────

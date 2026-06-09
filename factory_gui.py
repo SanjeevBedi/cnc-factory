@@ -870,12 +870,11 @@ class FactoryGUI(tk.Tk):
         self._running     = False
         # ── Base time loop ─────────────────────────────────────────────
         # No fixed DT -- each G-code line sleeps dt_sim / compression / speed.
-        # _last_dt_sim carries the current line physical duration (simulated-s)
-        # into _sim_loop and _auto_seed_tick.
+        # Three counters driven by the same base tick (SIM_TICK_S = 1 sim-s).
         self._speed:          float = 1.0
-        self._last_dt_sim:    float = config.SIM_T_AVG_S / 500.0  # fallback
-        self._last_gui_time:  float = 0.0
         self._sim_step_count: int   = 0
+        self._gui_acc:        float = 0.0   # simulated-s since last GUI refresh
+        self._seed_acc:       float = 0.0   # simulated-s since last seed offer
         self._eq: queue.Queue[GuiEvent]  = queue.Queue()
         self._gcode_cursors: dict[str, int]        = {}
         self._gcode_lines:   dict[str, list[str]]  = {}
@@ -908,17 +907,6 @@ class FactoryGUI(tk.Tk):
         self._seed_index: list[int] = []   # [seed0, seed1, …, seedN]
         self._seed_max_idx: int     = -1   # len(_seed_index) - 1
 
-        # Probability of submitting a new seed on any given sim-step.
-        #
-        #   parts_per_shift = N × SHIFT_S / T_avg
-        #   steps_per_shift = TARGET_WALL_S x SIM_COMPRESSION
-        #   p               = parts_per_shift / steps_per_shift
-        #
-        # seeds per simulated second needed to keep N machines busy
-        # p_step = _seed_lambda x dt_sim  (computed in _auto_seed_tick)
-        self._seed_lambda: float = (
-            config.SIM_N_MACHINES / config.SIM_T_AVG_S
-        )
 
         # Completed parts log
         self._completed_parts: list[dict] = []
@@ -1201,10 +1189,7 @@ class FactoryGUI(tk.Tk):
         self._do_sim_step()
 
     def _on_speed(self, _=None) -> None:
-        """
-        Speed multiplier (0.1x - 10x).
-        Scales wall sleep: dt_wall = dt_sim / (compression x speed).
-        """
+        """Speed slider: scales wall-clock sleep per tick."""
         self._speed = max(0.1, min(10.0, self._speed_var.get()))
         self._speed_lbl.configure(text=f"{self._speed:.1f}x")
 
@@ -1212,63 +1197,33 @@ class FactoryGUI(tk.Tk):
         """
         Main simulation loop.
 
-        Each step:
-          1. Advance sim by one G-code line (_do_sim_step).
-             _do_sim_step stores the physical duration of that line
-             (dist/feedrate in simulated seconds) in self._last_dt_sim.
-          2. Compute wall sleep:
-               dt_wall = dt_sim / (SIM_COMPRESSION x speed)
-          3. Check GUI repaint timer (wall clock, capped at SIM_GUI_MAX_FPS).
-          4. Sleep dt_wall (minimum SIM_MIN_STEP_S).
+        Each iteration:
+          - Advances SIM_TICK_S (= 1) simulated seconds.
+          - Sleeps SIM_TICK_S / (SIM_COMPRESSION x speed) wall-seconds.
+          - GUI counter   : accumulates sim-s; refresh every SIM_GUI_INTERVAL_S.
+          - Seed counter  : accumulates sim-s; offer seed every SIM_SEED_INTERVAL_S.
+          - Scheduler tick: fa.tick() called once (T_UNIT_SECONDS = 1).
         """
         import time as _time
-        self._last_gui_time = _time.monotonic()
+        wall_sleep_base = config.SIM_TICK_S / config.SIM_COMPRESSION
+
         while self._running:
             self._do_sim_step()
             self._sim_step_count += 1
 
-            dt_sim  = max(0.0, self._last_dt_sim)
-            dt_wall = dt_sim / (config.SIM_COMPRESSION * self._speed)
-            dt_wall = max(config.SIM_MIN_STEP_S, dt_wall)
-
-            now = _time.monotonic()
-            if now - self._last_gui_time >= (1.0 / config.SIM_GUI_MAX_FPS):
+            # GUI counter
+            self._gui_acc += config.SIM_TICK_S
+            if self._gui_acc >= config.SIM_GUI_INTERVAL_S:
                 self._post_gui_events()
-                self._last_gui_time = now
+                self._gui_acc = 0.0
 
-            _time.sleep(dt_wall)
+            # Seed counter
+            self._seed_acc += config.SIM_TICK_S
+            if self._seed_acc >= config.SIM_SEED_INTERVAL_S:
+                self._auto_seed_tick()
+                self._seed_acc = 0.0
 
-
-    @staticmethod
-    def _line_dt_sim(lines: list[str], cursor: int) -> float:
-        """
-        Return the physical duration (simulated seconds) of G-code line
-        at *cursor* by computing distance(prev, current) / feedrate.
-        Falls back to 0.0 for non-motion lines (comments, setup codes).
-        """
-        import re as _re, math as _math
-        if cursor <= 0 or cursor >= len(lines):
-            return 0.0
-        prev_line = lines[cursor - 1]
-        curr_line = lines[cursor]
-
-        def _coords(txt):
-            txt = txt.split(';')[0].upper()
-            x = float(m.group(1)) if (m := _re.search(r'X([-\d.]+)', txt)) else None
-            y = float(m.group(1)) if (m := _re.search(r'Y([-\d.]+)', txt)) else None
-            z = float(m.group(1)) if (m := _re.search(r'Z([-\d.]+)', txt)) else None
-            f = float(m.group(1)) if (m := _re.search(r'F([-\d.]+)', txt)) else None
-            return x, y, z, f
-
-        px, py, pz, _ = _coords(prev_line)
-        cx, cy, cz, cf = _coords(curr_line)
-        if cf is None or cf <= 0:
-            return 0.0
-        dx = (cx or 0.0) - (px or 0.0)
-        dy = (cy or 0.0) - (py or 0.0)
-        dz = (cz or 0.0) - (pz or 0.0)
-        dist = _math.sqrt(dx*dx + dy*dy + dz*dz)
-        return (dist / cf) * 60.0   # mm / (mm/min) * 60 = seconds
+            _time.sleep(wall_sleep_base / self._speed)
 
     def _do_sim_step(self) -> None:
         """
@@ -1392,9 +1347,6 @@ class FactoryGUI(tk.Tk):
             # 4. Advance cursor one line
             if lines and cur < len(lines):
                 self._gcode_cursors[mid] = cur + 1
-                dt = self._line_dt_sim(lines, cur + 1)
-                if dt > 0:
-                    self._last_dt_sim = dt
                 self._eq.put(GuiEvent("gcode_step", mid,
                                       {"lines": lines, "cursor": cur + 1}))
 
@@ -1492,26 +1444,14 @@ class FactoryGUI(tk.Tk):
 
     def _auto_seed_tick(self) -> None:
         """
-        Called every sim-step.  Decides whether to submit a new seed using
-        a single Poisson draw -- no graphics state involved.
-
-        Derivation (see config.py):
-            p_step = seed_lambda x dt_sim   (lambda = N / T_avg)
-
-        Expected seeds per shift = max factory throughput (ignoring
-        clamp/unclamp), so the scheduler queue stays bounded in steady state.
-
-        Safety cap: skip if scheduler queue >= SIM_MAX_QUEUE_AHEAD.
+        Called every SIM_SEED_INTERVAL_S simulated seconds by _sim_loop.
+        Offers one seed to the scheduler if the queue is not already full.
+        Rate: SHIFT_S / SIM_SEED_INTERVAL_S = 355 seeds per shift.
         """
         if not self._seed_index:
             return
         if len(self.fa.scheduler.job_queue) >= config.SIM_MAX_QUEUE_AHEAD:
             return
-        # p scales with the physical duration this step represents
-        p = self._seed_lambda * self._last_dt_sim
-        if random.random() >= p:
-            return
-
         idx  = random.randint(0, self._seed_max_idx)
         seed = self._seed_index[idx]
         self._fpanel.log(f"\U0001f331 Auto-seed {seed}", "ok")
