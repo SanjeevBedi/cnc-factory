@@ -965,15 +965,23 @@ class FactoryGUI(tk.Tk):
         self._tick_lbl.pack(side="left", padx=12)
 
         # ── Time-mapping speed control ──────────────────────────────────
-        # Slider → log10(time_scale): range -1 (0.1×) to 3 (1000×)
-        # time_scale = sim-seconds per real-second
-        # step_ms = 1000 / time_scale  (clamped 1…5000 ms)
-        self._time_scale_var = tk.DoubleVar(value=1.0)   # log10(ts); ts=10×
-        self._speed_lbl = tk.Label(top, text="1s sim=0.1s real",
-                                   bg="#0d1117", fg=DIM, font=("Courier", 8))
+        # Speed slider: linear multiplier 0.1× … 10× real-time.
+        # 1× = one G-code line animated per BASE_MS_PER_LINE ms of wall time.
+        # BASE_MS_PER_LINE is derived from the typical job
+        # (estimated_time_s / n_lines × 1000).  For our seeds: 30s / 20 = 1500 ms.
+        # At 1×: step_ms = 1500 ms  →  20-line job takes 30 s real.
+        # At 10×: step_ms = 150 ms  →  same job takes  3 s real.
+        # At 0.1×: step_ms = 15000 ms → same job takes 300 s real.
+        self._BASE_MS_PER_LINE: int   = 1500
+        self._speed_var = tk.DoubleVar(value=1.0)   # 0.1 … 10  (linear)
+        self._step_ms   = self._BASE_MS_PER_LINE     # set by _on_speed
+        self._speed_lbl = tk.Label(top, text="1.0×",
+                                   bg="#0d1117", fg=DIM, font=("Courier", 9))
         self._speed_lbl.pack(side="right", padx=(0, 2))
-        sc = ttk.Scale(top, variable=self._time_scale_var,
-                       from_=-1.0, to=3.0, orient="horizontal", length=100,
+        tk.Label(top, text="speed:", bg="#0d1117", fg=DIM,
+                 font=("Courier", 8)).pack(side="right", padx=(4, 0))
+        sc = ttk.Scale(top, variable=self._speed_var,
+                       from_=0.1, to=10.0, orient="horizontal", length=120,
                        command=self._on_speed)
         sc.pack(side="right", padx=2)
 
@@ -1172,27 +1180,18 @@ class FactoryGUI(tk.Tk):
 
     def _on_speed(self, _=None) -> None:
         """
-        Time-mapping speed control.
+        Real-time speed control.
 
-        Slider range : -1.0  ..  3.0   (log10 of time_scale)
-        time_scale   : 0.1   ..  1000  (sim-seconds per real-second)
+        Slider  : 0.1 ... 10.0  (direct speed multiplier)
+        1.0x    : step_ms = BASE_MS_PER_LINE  (1 G-code line per 1.5 s wall time)
+        10.0x   : step_ms = BASE_MS_PER_LINE / 10  (10x faster than real)
+        0.1x    : step_ms = BASE_MS_PER_LINE x 10  (10x slower than real)
 
-        1 sim-second executed in 10 real-seconds  → time_scale = 0.1  (slider = -1)
-        1 sim-second executed in 1 real-second    → time_scale = 1    (slider =  0)
-        1 sim-second executed in 0.001 real-secs  → time_scale = 1000 (slider =  3)
-
-        step_ms = 1000 / time_scale  (clamped to 1…5000 ms)
+        A 20-line job at 1x takes 30 s wall time -- matching estimated_time_s.
         """
-        log_ts = self._time_scale_var.get()          # -1.0 … 3.0
-        time_scale = 10 ** log_ts                    # 0.1  … 1000
-        self._step_ms = max(1, min(5000, int(1000 / time_scale)))
-        # Label: show as “1s sim = Xs real”
-        real_per_sim = 1.0 / time_scale
-        if real_per_sim >= 1.0:
-            lbl = f"1s sim={real_per_sim:.1f}s real"
-        else:
-            lbl = f"1s sim={real_per_sim*1000:.1f}ms real"
-        self._speed_lbl.configure(text=lbl)
+        speed = max(0.1, min(10.0, self._speed_var.get()))
+        self._step_ms = max(1, int(self._BASE_MS_PER_LINE / speed))
+        self._speed_lbl.configure(text=f"{speed:.1f}x")
 
     def _sim_loop(self) -> None:
         while self._running:
@@ -1226,39 +1225,18 @@ class FactoryGUI(tk.Tk):
         result = self.fa.tick()
         cur_tick = self.fa.scheduler.tick
 
-        # ── 2. Drain scheduler until every idle-in-sched machine has anim work ───
-        # When estimated_time_s < T_UNIT_SECONDS a job starts AND completes within
-        # a single scheduler tick.  Without catch-up ticks the GUI misses all
-        # assignments after the first.
-        #
-        # We keep ticking the scheduler (up to MAX_CATCH_UP extra ticks) until:
-        #   • every scheduler machine that is idle has a job queued for the GUI, OR
-        #   • the scheduler’s job_queue is empty (nothing more to assign).
-        _MAX_CATCH_UP = 8
-        _ticks_this_step = [cur_tick]   # track all ticks run this step
-        for _ in range(_MAX_CATCH_UP):
-            # Are there scheduler-idle machines that have nothing in their
-            # GUI animation queue AND the scheduler has jobs waiting?
-            sched_idle_with_work = [
-                sm for sm in self.fa.scheduler.machines
-                if sm.is_idle()
-                and self.fa.scheduler.job_queue
-                and len(self._anim_queues[sm.machine_id]) < 3  # headroom check
-            ]
-            if not sched_idle_with_work:
-                break
-            extra = self.fa.tick()
-            cur_tick = self.fa.scheduler.tick
-            _ticks_this_step.append(cur_tick)
-
-        # Capture jobs from ALL ticks run this step
+        # ── 2. Capture jobs from this tick, then catch-up if scheduler is ahead ──
+        # _capture_jobs is called after EACH tick so anim_queue depth is
+        # accurate before the next catch-up check.  This prevents the old
+        # bug where 8 ticks ran without updating depth, flooding each machine
+        # with up to 8 queued jobs and triggering the overflow pause.
         def _capture_jobs(tick_id: int) -> None:
             for sm in self.fa.scheduler.machines:
                 mid = sm.machine_id
                 if sm.current_job and sm.current_job.job_id not in self._anim_seen:
                     self._anim_seen.add(sm.current_job.job_id)
                     self._anim_queues[mid].append(sm.current_job)
-            # Same-tick completions (short jobs whose est_time < T_UNIT)
+            # Same-tick completions (est_time < T_UNIT so job starts+ends in 1 tick)
             for job in self.fa.scheduler.completed_jobs:
                 if (job.started_at_tick == tick_id
                         and job.assigned_machine_id
@@ -1266,8 +1244,26 @@ class FactoryGUI(tk.Tk):
                     self._anim_seen.add(job.job_id)
                     self._anim_queues[job.assigned_machine_id].append(job)
 
-        for t in _ticks_this_step:
-            _capture_jobs(t)
+        _capture_jobs(cur_tick)
+
+        # Catch-up: if the scheduler freed a machine (via Fix-A remaining_s=-1)
+        # and has jobs queued, run one extra tick so the assignment happens this
+        # step rather than the next.  Cap at 1 extra tick per step -- enough to
+        # handle the fix-A unclamp case without ever assigning more than 1 new
+        # job per machine per step.
+        _MAX_CATCH_UP = 1
+        for _ in range(_MAX_CATCH_UP):
+            needs = [
+                sm for sm in self.fa.scheduler.machines
+                if sm.is_idle()
+                and self.fa.scheduler.job_queue
+                and len(self._anim_queues[sm.machine_id]) < self._TARGET_Q_DEPTH
+            ]
+            if not needs:
+                break
+            self.fa.tick()
+            cur_tick = self.fa.scheduler.tick
+            _capture_jobs(cur_tick)
 
         # ── 3-6. Advance animation per machine ─────────────────────────────
         for ag in self.fa.agents:
