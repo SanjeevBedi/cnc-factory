@@ -53,34 +53,33 @@ T_UNIT_SECONDS: int = 60
 
 # ── Simulation time base ────────────────────────────────────────────────────
 # One sim-step = one G-code line animated.
-# SIM_DT_S = real seconds to sleep per sim-step at 1× speed.
+# Each G-code line has its own physical duration:
 #
-# Derivation (measured over 15 sample parts with cm→mm correction):
-#   T_avg        = 324.5 s  (mean machining time per part)
-#   L_avg        = 500      (mean G-code lines per job)
-#   Cycle_s      = T_avg + PART_SETUP_TIME_S + PART_REMOVAL_TIME_S ≈ 340 s
-#   parts/shift  = 4 machines × 28800 s / Cycle_s ≈ 339
-#   steps/shift  = 339 parts × 500 lines = 169 500 sim-steps
-#   SIM_DT_S     = 180 s wall / 169 500 steps = 0.00106 s  (1.06 ms)
+#   dt_sim  = distance(current, next) / feedrate   [simulated seconds]
+#   dt_wall = dt_sim / SIM_COMPRESSION              [wall-clock seconds]
 #
-# Speed slider (0.1×–10×): dt_actual = SIM_DT_S / speed
-# GUI repaint is decoupled — only every SIM_GUI_STEPS steps (~15 fps at 1×).
-# Hard cap: SIM_GUI_MAX_FPS prevents flooding Tkinter at high speeds.
-SIM_DT_S:        float = 0.00106   # seconds per sim-step at 1× speed
-SIM_GUI_STEPS:   int   = 63        # repaint every N sim-steps  (~15 fps at 1×)
-SIM_GUI_MAX_FPS: int   = 30        # hard cap: never repaint faster than this
+# SIM_COMPRESSION = SHIFT_S / SIM_TARGET_WALL_S = 28800 / 180 = 160
+# i.e. 1 simulated second plays out in 1/160 = 6.25 ms wall time at 1×.
+#
+# There is NO fixed SIM_DT_S -- each line sleeps for its own dt_wall.
+# SIM_MIN_STEP_S caps the minimum sleep (prevents spinning on zero-length
+# lines such as comments, tool changes, G90/G21 setup lines).
+# GUI repaint is decoupled: every SIM_GUI_PERIOD_S wall-seconds.
+SIM_COMPRESSION:  float = 160.0    # simulated seconds per wall-clock second
+SIM_MIN_STEP_S:   float = 0.001    # minimum wall sleep per step (1 ms)
+SIM_GUI_PERIOD_S: float = 0.05     # GUI repaint interval in wall-seconds (~20 fps)
+SIM_GUI_MAX_FPS:  int   = 30       # hard cap on GUI repaint rate
 
 # ── Seed generation probability ──────────────────────────────────────────────
-# Each sim-tick a single Poisson draw decides whether to submit a new seed.
+# Steps are variable duration (dist/feedrate per line), so probability
+# is expressed per simulated second and scaled by each step’s dt_sim:
 #
-# Derivation:
-#   parts_per_shift = N_MACHINES × SHIFT_S / T_avg         = 355 parts
-#   steps_per_shift = SIM_TARGET_WALL_S / SIM_DT_S          = 169 811 ticks
-#   p               = parts_per_shift / steps_per_shift      = 0.00209
+#   lambda  = N_MACHINES / T_avg          [seeds per simulated second]
+#   p_step  = lambda × dt_sim             [probability for this step]
+#           = N_MACHINES × dt_sim / T_avg
 #
-# The key: steps_per_shift uses the COMPRESSED wall time (3 min),
-# not the real shift duration (8 h).  Using real shift duration gives
-# p 160x too small, leaving machines idle 99% of the time.
+# Where dt_sim = distance / feedrate for the current G-code line.
+# For non-cutting steps (setup lines, unclamp ticks) a nominal dt is used.
 #
 # Safety cap: skip if scheduler queue >= SIM_MAX_QUEUE_AHEAD jobs.
 SIM_T_AVG_S:          float = 324.5   # measured mean machining time (s), cm→mm
