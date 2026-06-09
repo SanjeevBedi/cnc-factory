@@ -1,0 +1,226 @@
+\documentclass{article}
+\usepackage{amsmath}
+\usepackage{geometry}
+\usepackage{booktabs}
+\geometry{margin=1in}
+
+\title{Practical Feed and Speed Selection (Shop-Floor Method)}
+\author{Milling Supervisor Notes}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\section*{Original Context}
+You are selecting feeds and speeds for milling operations based on material, tool, and operation, with practical adjustments from shop-floor experience.
+
+\section*{Step 1: Select Surface Speed (SFM)}
+
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+Material & Carbide SFM Range \\
+\midrule
+Aluminum (6061) & 800--1200 \\
+Aluminum (cast) & 600--900 \\
+Mild Steel (1018) & 300--500 \\
+Alloy Steel (4140) & 200--400 \\
+Stainless Steel (304) & 150--300 \\
+Tool Steel (D2) & 100--250 \\
+Cast Iron & 400--700 \\
+Brass & 500--1000 \\
+Titanium (Ti-6Al-4V) & 80--200 \\
+Nickel Alloys (Inconel) & 50--150 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Adjustments:
+\begin{itemize}
+\item Poor rigidity: reduce 20--40\%
+\item Good coolant: increase slightly
+\item Worn machine: reduce
+\end{itemize}
+
+\section*{Step 2: Convert to RPM}
+\[
+RPM = \frac{SFM \times 3.82}{D}
+\]
+SI equivalent:
+\[
+N = \frac{1000 \cdot V}{\pi D}
+\]
+where $V$ is cutting speed in m/min and $D$ in mm.
+
+\section*{Step 3: Chip Load Selection}
+
+Definition:
+\begin{itemize}
+\item Small tools: diameter $< 12$ mm (0.5 in)
+\item Large tools: diameter $\geq 25$ mm (1 in)
+\end{itemize}
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+Tool Type & Chip Load (in/tooth) & Chip Load (mm/tooth) \\
+\midrule
+Small endmill & 0.001--0.003 & 0.025--0.075 \\
+Medium endmill & 0.002--0.006 & 0.05--0.15 \\
+Large face mill & 0.004--0.012 & 0.10--0.30 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Shop rule:
+\begin{quote}
+If chips are dust $\rightarrow$ feed too low. If machine screams $\rightarrow$ feed too high.
+\end{quote}
+
+\section*{Step 4: Feed Rate}
+\[
+Feed = RPM \times Z \times f_z
+\]
+SI equivalent:
+\[
+F = N \cdot Z \cdot f_z
+\]
+where $F$ is mm/min and $f_z$ in mm/tooth.
+
+\section*{Step 5: Practical Adjustments}
+
+\subsection*{Too Aggressive}
+\begin{itemize}
+\item Vibration or chatter
+\item Insert damage
+\item Loud cutting noise
+\end{itemize}
+Action: Reduce feed first, then depth.
+
+\subsection*{Too Conservative}
+\begin{itemize}
+\item Powder-like chips
+\item Rapid tool wear
+\item Work hardening
+\end{itemize}
+Action: Increase feed.
+
+\section*{Special Face Milling Notes}
+\begin{itemize}
+\item Full-width cuts: reduce feed 20--30\%
+\item Interrupted cuts: reduce speed 10--20\%
+\item Long tool overhang: reduce both speed and feed
+\end{itemize}
+
+\section*{Key Insight}
+Feed controls chip formation and heat removal, while speed mainly affects temperature.
+
+\section*{Supervisor Rule}
+\begin{quote}
+Tables get you close. Chips tell you the truth.
+\end{quote}
+
+
+
+\section*{Peck Drilling}
+Peck drilling is used to break chips, reduce heat, and prevent tool breakage in deep holes.
+
+\subsection*{Basic Rule}
+Peck depth ($Q$) depends on diameter $D$:
+\begin{itemize}
+\item Shallow holes ($< 2D$): no peck needed
+\item Moderate depth ($2D-5D$): $Q = 0.5D$ to $1D$
+\item Deep holes ($>5D$): $Q = 0.25D$ to $0.5D$
+\end{itemize}
+
+Typical formula:
+\[
+N = \frac{1000 V}{\pi D}, \quad F = N f
+\]
+where $f$ is feed per rev in mm/rev (SI).
+
+\subsection*{Example}
+Drill: 10 mm HSS drill in mild steel
+\begin{itemize}
+\item Cutting speed: $V = 25$ m/min
+\item RPM: $N = \frac{1000\cdot 25}{\pi\cdot 10} \approx 795$
+\item Feed per rev: $f = 0.15$ mm/rev
+\item Feed rate: $F \approx 120$ mm/min
+\item Peck depth: $Q = 5$ mm (0.5D)
+\end{itemize}
+
+Guidelines:
+\begin{itemize}
+\item Reduce peck as hole deepens
+\item Use coolant or air blast for chip evacuation
+\item Retract fully every 3--5 pecks in deep holes
+\end{itemize}
+
+\section*{Entry Methods for Pocket Machining}
+
+Entry strategy prevents tool damage and improves tool life.
+
+\subsection*{1. Plunge Entry}
+\begin{itemize}
+\item Direct vertical entry
+\item Use only for center-cutting tools
+\item Feed: 30--50\% of normal cutting feed
+\end{itemize}
+
+Example:
+12 mm endmill, normal feed = 800 mm/min
+\begin{itemize}
+\item Plunge feed: 300--400 mm/min
+\end{itemize}
+
+\subsection*{2. Ramp Entry}
+\begin{itemize}
+\item Tool enters at angle (1--3 degrees typical)
+\item Safer than plunge
+\item Use for most pocketing operations
+\end{itemize}
+
+Ramp angle relation:
+\[
+\tan(\theta) = \frac{\text{depth}}{\text{horizontal travel}}
+\]
+
+Example:
+Depth = 10 mm, angle = 2$^\circ$
+\begin{itemize}
+\item Horizontal distance $\approx 286$ mm
+\end{itemize}
+
+\subsection*{3. Helical Entry}
+\begin{itemize}
+\item Spirals into material
+\item Best load distribution
+\item Preferred for deep pockets
+\end{itemize}
+
+Typical parameters:
+\begin{itemize}
+\item Helix diameter: 1.2--1.5$\times$ tool diameter
+\item Pitch: 0.5--1.0 mm per revolution
+\end{itemize}
+
+Example:
+16 mm endmill
+\begin{itemize}
+\item Helix dia: 20--24 mm
+\item Pitch: 0.8 mm/rev
+\end{itemize}
+
+\subsection*{4. Pre-drill Entry}
+\begin{itemize}
+\item Drill hole first, then mill
+\item Useful for hard materials or large depths
+\end{itemize}
+
+\section*{Supervisor Insight}
+\begin{quote}
+Never force a tool straight into material unless it is designed for it. Entry strategy determines tool life more than cutting speed.
+\end{quote}
+
+\end{document}
