@@ -1195,20 +1195,48 @@ class FactoryGUI(tk.Tk):
         result = self.fa.tick()
         cur_tick = self.fa.scheduler.tick
 
-        # ── 2. Capture newly-assigned jobs into animation queues ─────────────
-        for sm in self.fa.scheduler.machines:
-            mid = sm.machine_id
-            # Jobs currently running on the scheduler
-            if sm.current_job and sm.current_job.job_id not in self._anim_seen:
-                self._anim_seen.add(sm.current_job.job_id)
-                self._anim_queues[mid].append(sm.current_job)
-        # Jobs that started AND finished in the same tick (estimated_time_s < T_UNIT)
-        for job in self.fa.scheduler.completed_jobs:
-            if (job.started_at_tick == cur_tick
-                    and job.assigned_machine_id
-                    and job.job_id not in self._anim_seen):
-                self._anim_seen.add(job.job_id)
-                self._anim_queues[job.assigned_machine_id].append(job)
+        # ── 2. Drain scheduler until every idle-in-sched machine has anim work ───
+        # When estimated_time_s < T_UNIT_SECONDS a job starts AND completes within
+        # a single scheduler tick.  Without catch-up ticks the GUI misses all
+        # assignments after the first.
+        #
+        # We keep ticking the scheduler (up to MAX_CATCH_UP extra ticks) until:
+        #   • every scheduler machine that is idle has a job queued for the GUI, OR
+        #   • the scheduler’s job_queue is empty (nothing more to assign).
+        _MAX_CATCH_UP = 8
+        _ticks_this_step = [cur_tick]   # track all ticks run this step
+        for _ in range(_MAX_CATCH_UP):
+            # Are there scheduler-idle machines that have nothing in their
+            # GUI animation queue AND the scheduler has jobs waiting?
+            sched_idle_with_work = [
+                sm for sm in self.fa.scheduler.machines
+                if sm.is_idle()
+                and self.fa.scheduler.job_queue
+                and len(self._anim_queues[sm.machine_id]) < 3  # headroom check
+            ]
+            if not sched_idle_with_work:
+                break
+            extra = self.fa.tick()
+            cur_tick = self.fa.scheduler.tick
+            _ticks_this_step.append(cur_tick)
+
+        # Capture jobs from ALL ticks run this step
+        def _capture_jobs(tick_id: int) -> None:
+            for sm in self.fa.scheduler.machines:
+                mid = sm.machine_id
+                if sm.current_job and sm.current_job.job_id not in self._anim_seen:
+                    self._anim_seen.add(sm.current_job.job_id)
+                    self._anim_queues[mid].append(sm.current_job)
+            # Same-tick completions (short jobs whose est_time < T_UNIT)
+            for job in self.fa.scheduler.completed_jobs:
+                if (job.started_at_tick == tick_id
+                        and job.assigned_machine_id
+                        and job.job_id not in self._anim_seen):
+                    self._anim_seen.add(job.job_id)
+                    self._anim_queues[job.assigned_machine_id].append(job)
+
+        for t in _ticks_this_step:
+            _capture_jobs(t)
 
         # ── 3-6. Advance animation per machine ─────────────────────────────
         for ag in self.fa.agents:
@@ -1235,6 +1263,15 @@ class FactoryGUI(tk.Tk):
                     if panel:
                         panel.set_idle_label()
                     self._eq.put(GuiEvent("gcode_clear", mid, {}))
+                    # Fix A: force the scheduler machine idle NOW so
+                    # _assign_jobs can pick up the next queued job
+                    # on the very next fa.tick() call.
+                    for sm in self.fa.scheduler.machines:
+                        if (sm.machine_id == mid
+                                and sm.current_job is not None
+                                and sm.current_job.job_id == info["job"].job_id):
+                            sm.remaining_s = -1.0   # triggers _complete_job next tick
+                            break
                 continue   # don’t advance animation during unclamp
 
             # 3. Start animating next queued job if canvas is empty
@@ -1372,10 +1409,19 @@ class FactoryGUI(tk.Tk):
         )
 
         # Machines with nothing animating AND nothing queued
+        # A machine is idle for auto-seed purposes when:
+        #   1. No G-code is currently animating on it
+        #   2. Its animation queue is empty
+        #   3. It is also idle in the scheduler (no pending assignment coming)
+        # Condition 3 prevents flooding the scheduler before it can assign.
+        sched_idle = {sm.machine_id for sm in self.fa.scheduler.machines
+                      if sm.is_idle()}
         idle_mids = [
             ag.machine_id for ag in self.fa.agents
             if not self._gcode_lines.get(ag.machine_id)
             and not self._anim_queues[ag.machine_id]
+            and self._unclamp[ag.machine_id] is None
+            and ag.machine_id in sched_idle
         ]
 
         if idle_mids:
