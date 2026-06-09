@@ -906,12 +906,13 @@ class FactoryGUI(tk.Tk):
         self._seed_index: list[int] = []   # [seed0, seed1, …, seedN]
         self._seed_max_idx: int     = -1   # len(_seed_index) - 1
 
-        # How many jobs to keep pre-queued per machine (prevents starvation)
-        self._TARGET_Q_DEPTH: int = 2
-
-        # Tracks threads currently running a pipeline for a given machine;
-        # prevents double-firing for the same machine simultaneously.
-        self._seeding_mid: set[str] = set()
+        # Probability of submitting a new seed on any given sim-step.
+        # p = N_MACHINES × SIM_DT_S / SIM_T_AVG_S  (Poisson, shift-balanced)
+        self._seed_prob: float = (
+            config.SIM_N_MACHINES
+            * config.SIM_DT_S
+            / config.SIM_T_AVG_S
+        )
 
         # Completed parts log
         self._completed_parts: list[dict] = []
@@ -1300,9 +1301,7 @@ class FactoryGUI(tk.Tk):
         for _ in range(_MAX_CATCH_UP):
             needs = [
                 sm for sm in self.fa.scheduler.machines
-                if sm.is_idle()
-                and self.fa.scheduler.job_queue
-                and len(self._anim_queues[sm.machine_id]) < self._TARGET_Q_DEPTH
+                if sm.is_idle() and self.fa.scheduler.job_queue
             ]
             if not needs:
                 break
@@ -1460,89 +1459,56 @@ class FactoryGUI(tk.Tk):
 
     def _auto_seed_tick(self) -> None:
         """
-        Called every sim step.
+        Called every sim-step.  Decides whether to submit a new seed using
+        a single Poisson draw -- no graphics state involved.
 
-        Strategy: PRE-QUEUE -- keep each machine's pipeline at TARGET_Q_DEPTH
-        parts ahead.  When the combined depth (animating + queued + unclamp)
-        falls below that target, immediately fire a pipeline thread.
+        Derivation (see config.py):
+            p = N_MACHINES x SIM_DT_S / SIM_T_AVG_S
 
-        Seed selection:
-            idx  = random.randint(0, _seed_max_idx)
-            seed = _seed_index[idx]
+        Expected seeds per shift = max factory throughput (ignoring
+        clamp/unclamp), so the scheduler queue stays bounded in steady state.
 
-        The same solid may be machined multiple times.  No deduplication.
-        Overflow guard: do not add more if any queue exceeds 10.
+        Safety cap: skip if scheduler queue >= SIM_MAX_QUEUE_AHEAD.
         """
         if not self._seed_index:
-            return   # library not built yet (Load Seeds not pressed)
+            return
+        if len(self.fa.scheduler.job_queue) >= config.SIM_MAX_QUEUE_AHEAD:
+            return
+        if random.random() >= self._seed_prob:
+            return
 
-        for ag in self.fa.agents:
-            mid = ag.machine_id
+        idx  = random.randint(0, self._seed_max_idx)
+        seed = self._seed_index[idx]
+        self._fpanel.log(f"\U0001f331 Auto-seed {seed}", "ok")
+        threading.Thread(
+            target=self._auto_seed_thread,
+            args=(seed,),
+            daemon=True,
+        ).start()
 
-            # Skip if overflow guard already active for this machine
-            if len(self._anim_queues[mid]) > 10:
-                continue
-
-            # Total depth: animating + waiting in queue + unclamp
-            anim_depth = (
-                len(self._anim_queues[mid])
-                + (1 if self._gcode_lines.get(mid) else 0)
-                + (1 if self._unclamp[mid] is not None else 0)
-            )
-
-            if anim_depth >= self._TARGET_Q_DEPTH:
-                continue   # already well-stocked
-            if mid in self._seeding_mid:
-                continue   # pipeline thread already running for this machine
-
-            # Random index selection from the indexed solid library
-            idx  = random.randint(0, self._seed_max_idx)
-            seed = self._seed_index[idx]
-
-            self._fpanel.log(
-                f"\U0001f331 Auto-seed idx={idx} -> seed={seed}  "
-                f"({mid} depth={anim_depth}->{self._TARGET_Q_DEPTH})",
-                "ok"
-            )
-            self._seeding_mid.add(mid)
-            threading.Thread(
-                target=self._auto_seed_thread,
-                args=(seed, mid),
-                daemon=True,
-            ).start()
-
-    def _auto_seed_thread(self, seed: int, target_mid: str) -> None:
-        """
-        Background thread: run the CAM pipeline for *seed* and submit
-        it to the scheduler.  Always clears _seeding_mid[target_mid]
-        on exit so the next auto-seed fire can happen.
-        """
+    def _auto_seed_thread(self, seed: int) -> None:
+        """Background thread: run CAM pipeline and submit job to scheduler."""
         try:
             win = self._pipeline_wins.get(seed)
             progress_cb = (win.progress
                            if win and win.winfo_exists() else None)
-
             job = self.fa.submit_new_seed(seed, progress_cb=progress_cb)
-
             if job:
                 entry = {
                     "seed":    seed,
                     "job_id":  job.job_id,
                     "lines":   len(job.gcode_lines),
                     "status":  "queued",
-                    "machine": target_mid,
+                    "machine": "\u2014",
                 }
                 self._all_jobs.append(entry)
                 self._eq.put(GuiEvent("job_registered", "factory",
                                        {"entry": entry}))
             else:
                 self._fpanel.log(
-                    f"⚠ Pipeline returned None for seed {seed} — skipping",
-                    "warn")
+                    f"\u26a0 Pipeline returned None for seed {seed}", "warn")
         except Exception as exc:
-            self._fpanel.log(f"❌ Auto-seed thread error: {exc}", "warn")
-        finally:
-            self._seeding_mid.discard(target_mid)
+            self._fpanel.log(f"\u274c Auto-seed error: {exc}", "warn")
 
     def _open_queue_window(self) -> None:
         """Open (or raise) the single parts-queue display window."""

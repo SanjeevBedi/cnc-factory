@@ -70,6 +70,23 @@ SIM_DT_S:        float = 0.00106   # seconds per sim-step at 1× speed
 SIM_GUI_STEPS:   int   = 63        # repaint every N sim-steps  (~15 fps at 1×)
 SIM_GUI_MAX_FPS: int   = 30        # hard cap: never repaint faster than this
 
+# ── Seed generation probability ──────────────────────────────────────────────
+# Each sim-tick a single random draw decides whether to submit a new seed.
+# Probability is set so the expected number of submissions per shift exactly
+# matches the maximum throughput of the factory (ignoring clamp/unclamp):
+#
+#   max_parts   = N_MACHINES × SHIFT_HOURS × 3600 / SIM_T_AVG_S  = 355
+#   total_ticks = SHIFT_HOURS × 3600 / SIM_DT_S                   = 27 169 811
+#   p           = max_parts / total_ticks
+#               = N_MACHINES × SIM_DT_S / SIM_T_AVG_S             = 1.307e-5
+#
+# Safety cap: submission is skipped when the scheduler queue already
+# holds SIM_MAX_QUEUE_AHEAD or more unassigned jobs.
+SIM_T_AVG_S:         float = 324.5   # measured mean machining time (s), cm→mm
+SIM_SHIFT_HOURS:     float = 8.0     # shift length (hours)
+SIM_N_MACHINES:      int   = 4       # number of CNC machines
+SIM_MAX_QUEUE_AHEAD: int   = 8       # safety cap on scheduler queue depth
+
 # ── Feature Extractor ─────────────────────────────────────────────────────────
 # A face with normal.z > this is a TOP face (machined from above)
 NORMAL_UP_THRESHOLD: float = 0.9
