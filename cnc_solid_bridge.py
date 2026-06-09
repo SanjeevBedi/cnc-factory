@@ -78,7 +78,8 @@ def load_face_polygons(seed: int | str) -> list[dict]:
         )
     data = np.load(str(path), allow_pickle=True).item()
     faces: list[dict] = data.get("faces", [])
-    # Ensure outer_boundary is always a numpy array
+
+    # ── 1. Normalise to numpy arrays ─────────────────────────────────────────
     for face in faces:
         if not isinstance(face["outer_boundary"], np.ndarray):
             face["outer_boundary"] = np.array(face["outer_boundary"], dtype=float)
@@ -87,6 +88,35 @@ def load_face_polygons(seed: int | str) -> list[dict]:
             np.array(h, dtype=float) if not isinstance(h, np.ndarray) else h
             for h in holes
         ]
+
+    # ── 2. Unit conversion: cm → mm ──────────────────────────────────────────
+    # Build_Solid.py generates coordinates in cm; the toolpath planner,
+    # feeds-and-speeds, and G-code generator all operate in mm.
+    cm2mm = config.GEOM_CM_TO_MM        # default 10.0
+    for face in faces:
+        face["outer_boundary"] = face["outer_boundary"] * cm2mm
+        face["holes"] = [h * cm2mm for h in face["holes"]]
+
+    # ── 3. Minimum-footprint enforcement ─────────────────────────────────────
+    # If the part’s XY footprint < MIN_FOOTPRINT_FRACTION of the workspace,
+    # scale the whole solid up uniformly (XYZ) so the smallest workable
+    # parts still produce realistic toolpaths and machining times.
+    if faces and config.MIN_FOOTPRINT_FRACTION > 0.0:
+        all_pts = np.vstack([
+            face["outer_boundary"] for face in faces
+            if len(face["outer_boundary"])
+        ])
+        part_x = float(all_pts[:, 0].max() - all_pts[:, 0].min())
+        part_y = float(all_pts[:, 1].max() - all_pts[:, 1].min())
+        part_area = part_x * part_y
+        ws_area   = config.MACHINE_WORKSPACE_X_MM * config.MACHINE_WORKSPACE_Y_MM
+        min_area  = ws_area * config.MIN_FOOTPRINT_FRACTION
+        if part_area < min_area and part_area > 0.0:
+            extra = (min_area / part_area) ** 0.5  # uniform XYZ scale
+            for face in faces:
+                face["outer_boundary"] = face["outer_boundary"] * extra
+                face["holes"] = [h * extra for h in face["holes"]]
+
     return faces
 
 

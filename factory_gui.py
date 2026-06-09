@@ -869,11 +869,11 @@ class FactoryGUI(tk.Tk):
         self._demo_break  = demo_break   # (machine_id, tick)
         self._running     = False
         # ── Base time loop ─────────────────────────────────────────────
-        # _dt_s  = real seconds per sim-step at the current speed setting.
-        # At 1× it equals config.SIM_DT_S (default 1.0 s).
-        # All durations expressed in sim-steps derive from config.SIM_DT_S
-        # so they stay meaningful regardless of the speed slider position.
-        self._dt_s: float = config.SIM_DT_S       # updated by _on_speed
+        # _dt_s  = real seconds to sleep per sim-step  (= SIM_DT_S / speed).
+        # GUI repaints only every _gui_steps steps; capped at SIM_GUI_MAX_FPS.
+        self._dt_s:      float = config.SIM_DT_S
+        self._gui_steps: int   = config.SIM_GUI_STEPS   # recomputed by _on_speed
+        self._sim_step_count:  int = 0
         self._eq: queue.Queue[GuiEvent]  = queue.Queue()
         self._gcode_cursors: dict[str, int]        = {}
         self._gcode_lines:   dict[str, list[str]]  = {}
@@ -889,9 +889,17 @@ class FactoryGUI(tk.Tk):
         # dict: mid → {"job": job, "steps": int}
         self._unclamp: dict[str, Optional[dict]] = {}
         # Steps for visual unclamp phase (proportional to PART_REMOVAL_TIME_S)
-        # Unclamp duration in sim-steps (derived from base dt).
-        # At 1× (dt=1 s): 120 steps = 120 real seconds of part removal.
-        self._UNCLAMP_STEPS: int = round(config.PART_REMOVAL_TIME_S / config.SIM_DT_S)
+        # Unclamp and setup durations in sim-steps.
+        # Each step represents T_avg/L_avg seconds of machining time,
+        # so these express the physical durations relative to the job length.
+        # UNCLAMP = PART_REMOVAL_TIME_S / (T_avg/L_avg)
+        #         = PART_REMOVAL_TIME_S * L_avg / T_avg
+        # Use a fixed ratio: removal is ~1.5% of machining time  (5/340)
+        # giving  round(500 * 5/340) = 7 steps.
+        _T_avg_s  = 324.5
+        _L_avg    = 500
+        self._UNCLAMP_STEPS: int = max(3, round(
+            config.PART_REMOVAL_TIME_S * _L_avg / _T_avg_s))
 
         # Indexed solid library — built once on first Load Seeds press.
         # Index i → seed value.  Random index selection allows repeats.
@@ -982,7 +990,7 @@ class FactoryGUI(tk.Tk):
         # Speed slider: 0.1× … 10×  (linear, direct multiplier of 1/dt)
         # Label shows current speed and the resulting dt.
         self._speed_var = tk.DoubleVar(value=1.0)
-        self._speed_lbl = tk.Label(top, text=f"1.0×  dt={config.SIM_DT_S:.2f}s",
+        self._speed_lbl = tk.Label(top, text=f"1.0×",  # updated by _on_speed
                                    bg="#0d1117", fg=DIM, font=("Courier", 9))
         self._speed_lbl.pack(side="right", padx=(0, 2))
         tk.Label(top, text="speed:", bg="#0d1117", fg=DIM,
@@ -1187,34 +1195,47 @@ class FactoryGUI(tk.Tk):
 
     def _on_speed(self, _=None) -> None:
         """
-        Speed control -- scales the base sim dt.
+        Speed control.
 
-        Slider : 0.1× … 10×   (linear, direct multiplier)
+        Slider : 0.1× … 10×   (linear multiplier)
+        dt_actual = SIM_DT_S / speed   (real seconds per sim-step)
 
-        dt (real seconds per sim-step) = SIM_DT_S / speed
+        At 1×: one 8-hour shift plays out in 3 minutes wall time.
+        GUI repaint rate is clamped to SIM_GUI_MAX_FPS regardless of speed.
 
-          speed  dt        20-line job
-          -----  --------  -----------
-          0.1×   10.00 s   200 s wall
-          0.5×    2.00 s    40 s wall
-          1.0×    1.00 s    20 s wall   ← base (SIM_DT_S)
-          2.0×    0.50 s    10 s wall
-          5.0×    0.20 s     4 s wall
-          10×     0.10 s     2 s wall
+          speed   shift wall
+          ------  ----------
+          0.1×    30 min
+          0.5×     6 min
+          1.0×     3 min   ← default
+          2.0×    90 sec
+          5.0×    36 sec
+          10×     18 sec
         """
-        speed = max(0.1, min(10.0, self._speed_var.get()))
-        self._dt_s = config.SIM_DT_S / speed
-        self._speed_lbl.configure(text=f"{speed:.1f}×  dt={self._dt_s:.2f}s")
+        speed          = max(0.1, min(10.0, self._speed_var.get()))
+        self._dt_s     = config.SIM_DT_S / speed
+        # Repaint every N steps so GUI period ≥ 1/SIM_GUI_MAX_FPS
+        min_gui_period = 1.0 / config.SIM_GUI_MAX_FPS
+        self._gui_steps = max(1, round(min_gui_period / self._dt_s))
+        self._speed_lbl.configure(text=f"{speed:.1f}×")
 
     def _sim_loop(self) -> None:
         """
-        Main simulation loop.  Sleeps for _dt_s seconds between steps.
-        _dt_s = config.SIM_DT_S / speed  (set by _on_speed).
-        Everything inside _do_sim_step advances by exactly one sim-step
-        (one G-code line, one scheduler sub-tick, one unclamp count-down tick).
+        Main simulation loop.
+
+        Each iteration:
+          1. Advance sim by one step (_do_sim_step).
+          2. Every _gui_steps steps: flush GUI events (KPI, machine state).
+          3. Sleep _dt_s seconds.
+
+        _gui_steps is recomputed by _on_speed so the GUI never repaints
+        faster than SIM_GUI_MAX_FPS regardless of the speed setting.
         """
         while self._running:
             self._do_sim_step()
+            self._sim_step_count += 1
+            if self._sim_step_count % self._gui_steps == 0:
+                self._post_gui_events()
             time.sleep(self._dt_s)
 
     def _do_sim_step(self) -> None:
@@ -1376,12 +1397,24 @@ class FactoryGUI(tk.Tk):
         # ── 8. Auto-seed generation ────────────────────────────────────────
         self._auto_seed_tick()
 
-        # ── 9. Post KPI + machine state updates ────────────────────────────
+        # ── 9. Stash tick/result for GUI flush ────────────────────────────
+        # _post_gui_events() is called by _sim_loop every _gui_steps steps
+        # (capped at SIM_GUI_MAX_FPS) rather than on every sim-step.
+        self._last_tick   = cur_tick
+        self._last_result = result
+
+    def _post_gui_events(self) -> None:
+        """Post KPI + machine-state events.  Called by _sim_loop every
+        _gui_steps steps so the GUI repaint rate is capped at SIM_GUI_MAX_FPS
+        regardless of how fast the sim-loop is running."""
+        result = self._last_result
+        cmds   = ([{"mid": c.target_machine_id, "action": c.action}
+                   for c in result.commands_sent]
+                  if result else [])
         self._eq.put(GuiEvent("factory_update", "factory", {
-            "tick":  cur_tick,
+            "tick":  self._last_tick,
             "kpis":  self.fa.get_production_kpis(),
-            "cmds":  [{"mid": c.target_machine_id, "action": c.action}
-                       for c in result.commands_sent],
+            "cmds":  cmds,
         }))
         for ag in self.fa.agents:
             self._eq.put(GuiEvent("machine_update", ag.machine_id,

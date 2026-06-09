@@ -52,16 +52,23 @@ SEED_CREATION_PROB: float = 0.002 / 100   # 2e-5  (×10 vs previous 2e-6)
 T_UNIT_SECONDS: int = 60
 
 # ── Simulation time base ────────────────────────────────────────────────────
-# SIM_DT_S is the canonical heartbeat of the simulation loop at 1× speed.
-# One sim step = one G-code line animated = SIM_DT_S real seconds at 1×.
-# Speed slider (0.1× … 10×) scales the actual sleep to SIM_DT_S / speed.
+# One sim-step = one G-code line animated.
+# SIM_DT_S = real seconds to sleep per sim-step at 1× speed.
 #
-# Derived quantities (all in sim-steps, independent of real-time speed):
-#   UNCLAMP_STEPS = round(PART_REMOVAL_TIME_S / SIM_DT_S)   =   5 steps
-#   SETUP_STEPS   = round(PART_SETUP_TIME_S   / SIM_DT_S)   =  10 steps
+# Derivation (measured over 15 sample parts with cm→mm correction):
+#   T_avg        = 324.5 s  (mean machining time per part)
+#   L_avg        = 500      (mean G-code lines per job)
+#   Cycle_s      = T_avg + PART_SETUP_TIME_S + PART_REMOVAL_TIME_S ≈ 340 s
+#   parts/shift  = 4 machines × 28800 s / Cycle_s ≈ 339
+#   steps/shift  = 339 parts × 500 lines = 169 500 sim-steps
+#   SIM_DT_S     = 180 s wall / 169 500 steps = 0.00106 s  (1.06 ms)
 #
-# At 1× speed a 20-line job takes 20 s real; at 10× the same job takes 2 s.
-SIM_DT_S: float = 1.0   # seconds per sim-step at 1× speed
+# Speed slider (0.1×–10×): dt_actual = SIM_DT_S / speed
+# GUI repaint is decoupled — only every SIM_GUI_STEPS steps (~15 fps at 1×).
+# Hard cap: SIM_GUI_MAX_FPS prevents flooding Tkinter at high speeds.
+SIM_DT_S:        float = 0.00106   # seconds per sim-step at 1× speed
+SIM_GUI_STEPS:   int   = 63        # repaint every N sim-steps  (~15 fps at 1×)
+SIM_GUI_MAX_FPS: int   = 30        # hard cap: never repaint faster than this
 
 # ── Feature Extractor ─────────────────────────────────────────────────────────
 # A face with normal.z > this is a TOP face (machined from above)
@@ -69,6 +76,22 @@ NORMAL_UP_THRESHOLD: float = 0.9
 
 # A face with |normal.z| < this is VERTICAL (wall-like)
 NORMAL_VERTICAL_THRESHOLD: float = 0.1
+
+# ── Machine workspace & geometry units ──────────────────────────────────────
+# Solid coordinates are generated in cm by Build_Solid.py.
+# The rest of the pipeline (toolpath, feeds-and-speeds, G-code) works in mm.
+# cnc_solid_bridge.load_face_polygons() applies GEOM_CM_TO_MM, then enforces
+# the minimum footprint rule, before handing geometry downstream.
+#
+# Workspace: representative VMC travel (Haas VF-2 class).
+MACHINE_WORKSPACE_X_MM: float = 500.0   # X travel, mm
+MACHINE_WORKSPACE_Y_MM: float = 400.0   # Y travel, mm
+
+GEOM_CM_TO_MM: float = 10.0             # cm → mm unit conversion factor
+
+# A part whose XY footprint < MIN_FOOTPRINT_FRACTION of workspace area
+# is scaled up uniformly until it meets the threshold.
+MIN_FOOTPRINT_FRACTION: float = 0.10    # 10 % of workspace XY area
 
 # Vertex matching tolerance (mm) when comparing edge endpoints across faces
 EDGE_MATCH_TOLERANCE: float = 1e-2
