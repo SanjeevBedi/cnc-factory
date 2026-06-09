@@ -886,10 +886,17 @@ class FactoryGUI(tk.Tk):
         # Steps for visual unclamp phase (proportional to PART_REMOVAL_TIME_S)
         self._UNCLAMP_STEPS: int = max(5, int(config.PART_REMOVAL_TIME_S / 20))
 
-        # Auto-seed generation
-        self._seed_gen_prob: float      = config.SEED_CREATION_PROB
-        self._available_seeds: list[int]= []   # populated on first Load Seeds
-        self._loaded_seeds: set[int]    = set() # seeds submitted this session
+        # Indexed solid library — built once on first Load Seeds press.
+        # Index i → seed value.  Random index selection allows repeats.
+        self._seed_index: list[int] = []   # [seed0, seed1, …, seedN]
+        self._seed_max_idx: int     = -1   # len(_seed_index) - 1
+
+        # How many jobs to keep pre-queued per machine (prevents starvation)
+        self._TARGET_Q_DEPTH: int = 2
+
+        # Tracks threads currently running a pipeline for a given machine;
+        # prevents double-firing for the same machine simultaneously.
+        self._seeding_mid: set[str] = set()
 
         # Completed parts log
         self._completed_parts: list[dict] = []
@@ -1039,36 +1046,47 @@ class FactoryGUI(tk.Tk):
     # ── Seed loading ────────────────────────────────────────────────────────────
 
     def _prompt_load_seeds(self) -> None:
-        """Ask how many seeds to load, then kick off the pipeline thread."""
+        """
+        Build the indexed solid library on first call, then ask which seeds
+        to load initially.  Repeats are always allowed — the same solid can
+        be machined any number of times.
+        """
         import tkinter.simpledialog as sd
         import cnc_solid_bridge as bridge
-        available = bridge.list_available_seeds()
-        if available:
-            # Persist for auto-seed generation
-            self._available_seeds = list(available)
+
+        # ── Build (or refresh) the indexed library ─────────────────────────
+        available = bridge.list_available_seeds()   # sorted list of int seeds
         if not available:
             from tkinter import messagebox
             messagebox.showwarning(
                 "No Seeds",
-                f"No .npy files found in:\n{config.SOLID_OUTPUT_DIR}"
-            )
+                f"No .npy files found in:\n{config.SOLID_OUTPUT_DIR}")
             return
+
+        self._seed_index   = available           # index 0 … N-1
+        self._seed_max_idx = len(available) - 1  # inclusive upper bound
+
+        self._fpanel.log(
+            f"🗂  Solid library: {len(available)} parts indexed  "
+            f"(idx 0 … {self._seed_max_idx})", "ok")
+
+        # ── Ask user which seeds to start with ──────────────────────────
         ans = sd.askstring(
             "Load Seeds",
-            f"{len(available)} seeds available.\n"
-            "Enter seed numbers separated by spaces,\n"
-            "or leave blank to auto-pick up to 4:",
+            f"{len(available)} solids in library (idx 0 – {self._seed_max_idx}).\n"
+            "Enter seed numbers, OR leave blank to pick 4 at random:",
             parent=self,
         )
         if ans is None:          # cancelled
             return
+
         if ans.strip():
             try:
                 seeds = [int(x) for x in ans.split()]
             except ValueError:
-                seeds = available[:4]
+                seeds = self._pick_random_seeds(4)
         else:
-            seeds = available[:4]
+            seeds = self._pick_random_seeds(4)
 
         self._fpanel.log(f"Loading {len(seeds)} seed(s): {seeds}", "ok")
         threading.Thread(
@@ -1076,6 +1094,19 @@ class FactoryGUI(tk.Tk):
             args=(seeds,),
             daemon=True,
         ).start()
+
+    def _pick_random_seeds(self, n: int) -> list[int]:
+        """
+        Pick *n* seeds by drawing random indices in [0, _seed_max_idx].
+        The same solid may appear more than once — that is intentional.
+        Returns an empty list if the library has not been built yet.
+        """
+        if not self._seed_index:
+            return []
+        return [
+            self._seed_index[random.randint(0, self._seed_max_idx)]
+            for _ in range(n)
+        ]
 
     def _load_seeds_thread(self, seeds: list[int]) -> None:
         """
@@ -1376,90 +1407,89 @@ class FactoryGUI(tk.Tk):
 
     def _auto_seed_tick(self) -> None:
         """
-        Called every sim step.  Two operating modes:
+        Called every sim step.
 
-        IDLE-DEMAND mode  (any machine has an empty animation queue)
-        ─────────────────
-        Each idle machine needs work.  Effective probability scales with
-        the idle count so multiple machines are re-filled quickly:
+        Strategy: PRE-QUEUE -- keep each machine's pipeline at TARGET_Q_DEPTH
+        parts ahead.  When the combined depth (animating + queued + unclamp)
+        falls below that target, immediately fire a pipeline thread.
 
-            eff_prob = 0.05 × min(idle_count, 4)   →  5 % … 20 %
+        Seed selection:
+            idx  = random.randint(0, _seed_max_idx)
+            seed = _seed_index[idx]
 
-        Default sim rate is ~2 steps/s (speed slider=3, _step_ms=533 ms).
-        At 2 steps/second:
-            1 idle machine  →  avg 10 steps  →  ~5 s until new seed
-            2 idle machines →  avg  5 steps  →  ~2.5 s
-            3+              →  avg  3 steps  →  ~1.5 s
-
-        BACKGROUND mode  (all machines busy)
-        ──────────────────────────────────────
-            eff_prob = base_prob / 10^overloaded_queues
-            base_prob = config.SEED_CREATION_PROB  (0.002%  = 2e-5)
-
-        Overload reduction (queue depth > 10):
-            each overloaded machine divides effective probability by 10.
+        The same solid may be machined multiple times.  No deduplication.
+        Overflow guard: do not add more if any queue exceeds 10.
         """
-        if not self._available_seeds:
-            return
+        if not self._seed_index:
+            return   # library not built yet (Load Seeds not pressed)
 
-        # Count overloaded queues (backpressure)
-        overloaded = sum(
-            1 for ag in self.fa.agents
-            if len(self._anim_queues[ag.machine_id]) > 10
-        )
+        for ag in self.fa.agents:
+            mid = ag.machine_id
 
-        # Machines with nothing animating AND nothing queued
-        # A machine is idle for auto-seed purposes when:
-        #   1. No G-code is currently animating on it
-        #   2. Its animation queue is empty
-        #   3. It is also idle in the scheduler (no pending assignment coming)
-        # Condition 3 prevents flooding the scheduler before it can assign.
-        sched_idle = {sm.machine_id for sm in self.fa.scheduler.machines
-                      if sm.is_idle()}
-        idle_mids = [
-            ag.machine_id for ag in self.fa.agents
-            if not self._gcode_lines.get(ag.machine_id)
-            and not self._anim_queues[ag.machine_id]
-            and self._unclamp[ag.machine_id] is None
-            and ag.machine_id in sched_idle
-        ]
+            # Skip if overflow guard already active for this machine
+            if len(self._anim_queues[mid]) > 10:
+                continue
 
-        if idle_mids:
-            # Idle-demand mode — probability rises with idle machine count
-            eff_prob = 0.05 * min(len(idle_mids), 4)   # 5 % – 20 %
-            mode_tag = f"idle-demand [{', '.join(idle_mids)}]"
-        else:
-            # Background mode — base rate, back-off for overloaded queues
-            eff_prob = (
-                self._seed_gen_prob / (10 ** overloaded)
-                if overloaded else self._seed_gen_prob
+            # Total depth: animating + waiting in queue + unclamp
+            anim_depth = (
+                len(self._anim_queues[mid])
+                + (1 if self._gcode_lines.get(mid) else 0)
+                + (1 if self._unclamp[mid] is not None else 0)
             )
-            mode_tag = f"background  overloaded_qs={overloaded}"
 
-        if random.random() >= eff_prob:
-            return
+            if anim_depth >= self._TARGET_Q_DEPTH:
+                continue   # already well-stocked
+            if mid in self._seeding_mid:
+                continue   # pipeline thread already running for this machine
 
-        # Pick a seed not yet submitted this session; cycle when exhausted
-        remaining = [s for s in self._available_seeds
-                     if s not in self._loaded_seeds]
-        if not remaining:
-            self._loaded_seeds.clear()
-            remaining = list(self._available_seeds)
+            # Random index selection from the indexed solid library
+            idx  = random.randint(0, self._seed_max_idx)
+            seed = self._seed_index[idx]
 
-        seed = random.choice(remaining)
-        self._loaded_seeds.add(seed)
+            self._fpanel.log(
+                f"\U0001f331 Auto-seed idx={idx} -> seed={seed}  "
+                f"({mid} depth={anim_depth}->{self._TARGET_Q_DEPTH})",
+                "ok"
+            )
+            self._seeding_mid.add(mid)
+            threading.Thread(
+                target=self._auto_seed_thread,
+                args=(seed, mid),
+                daemon=True,
+            ).start()
 
-        self._fpanel.log(
-            f"🌱 Auto-seed {seed}  p={eff_prob*100:.3f}%  {mode_tag}",
-            "ok"
-        )
-        threading.Thread(
-            target=self._load_seeds_thread,
-            args=([seed],),
-            daemon=True,
-        ).start()
+    def _auto_seed_thread(self, seed: int, target_mid: str) -> None:
+        """
+        Background thread: run the CAM pipeline for *seed* and submit
+        it to the scheduler.  Always clears _seeding_mid[target_mid]
+        on exit so the next auto-seed fire can happen.
+        """
+        try:
+            win = self._pipeline_wins.get(seed)
+            progress_cb = (win.progress
+                           if win and win.winfo_exists() else None)
 
-    # ── Parts queue window ────────────────────────────────────────────────
+            job = self.fa.submit_new_seed(seed, progress_cb=progress_cb)
+
+            if job:
+                entry = {
+                    "seed":    seed,
+                    "job_id":  job.job_id,
+                    "lines":   len(job.gcode_lines),
+                    "status":  "queued",
+                    "machine": target_mid,
+                }
+                self._all_jobs.append(entry)
+                self._eq.put(GuiEvent("job_registered", "factory",
+                                       {"entry": entry}))
+            else:
+                self._fpanel.log(
+                    f"⚠ Pipeline returned None for seed {seed} — skipping",
+                    "warn")
+        except Exception as exc:
+            self._fpanel.log(f"❌ Auto-seed thread error: {exc}", "warn")
+        finally:
+            self._seeding_mid.discard(target_mid)
 
     def _open_queue_window(self) -> None:
         """Open (or raise) the single parts-queue display window."""
