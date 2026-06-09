@@ -1258,12 +1258,23 @@ class FactoryGUI(tk.Tk):
         # accurate before the next catch-up check.  This prevents the old
         # bug where 8 ticks ran without updating depth, flooding each machine
         # with up to 8 queued jobs and triggering the overflow pause.
+        # Overhead to add to remaining_s when a job is first assigned.
+        # The scheduler only sets remaining_s = estimated_time_s (machining).
+        # Adding setup + removal + buffer makes the scheduler cycle at the
+        # full CYCLE_S rate, keeping it in sync with the seed interval.
+        _cycle_overhead = (config.PART_SETUP_TIME_S
+                           + config.PART_REMOVAL_TIME_S
+                           + config.PART_BUFFER_TIME_S)
+
         def _capture_jobs(tick_id: int) -> None:
             for sm in self.fa.scheduler.machines:
                 mid = sm.machine_id
                 if sm.current_job and sm.current_job.job_id not in self._anim_seen:
                     self._anim_seen.add(sm.current_job.job_id)
                     self._anim_queues[mid].append(sm.current_job)
+                    # Stretch remaining_s to full cycle so scheduler doesn't
+                    # complete the job until clamp + unclamp + buffer have passed.
+                    sm.remaining_s += _cycle_overhead
             # Jobs that completed THIS tick (est_time_s < T_UNIT means a job
             # starts in tick N and finishes in tick N+1; checking started_at_tick
             # always misses them because started!=finished.  Use finished_at_tick.
