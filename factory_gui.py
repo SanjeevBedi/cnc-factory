@@ -896,11 +896,9 @@ class FactoryGUI(tk.Tk):
         # UNCLAMP = PART_REMOVAL_TIME_S / (T_avg/L_avg)
         #         = PART_REMOVAL_TIME_S * L_avg / T_avg
         # Use a fixed ratio: removal is ~1.5% of machining time  (5/340)
-        # giving  round(500 * 5/340) = 7 steps.
-        _T_avg_s  = 324.5
-        _L_avg    = 500
-        self._UNCLAMP_STEPS: int = max(3, round(
-            config.PART_REMOVAL_TIME_S * _L_avg / _T_avg_s))
+        # T_UNIT_SECONDS = 1 s, so steps == simulated seconds directly.
+        self._UNCLAMP_STEPS: int = round(config.PART_REMOVAL_TIME_S)   # 60 steps
+        self._SETUP_STEPS:   int = round(config.PART_SETUP_TIME_S)     # 60 steps
 
         # Indexed solid library — built once on first Load Seeds press.
         # Index i → seed value.  Random index selection allows repeats.

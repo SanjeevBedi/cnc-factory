@@ -73,7 +73,12 @@ SIM_TICK_S:           float = 1.0     # simulated seconds advanced per loop iter
 SIM_TARGET_WALL_S:    float = 180.0   # wall-clock seconds for one full shift at 1x
 SIM_COMPRESSION:      float = 160.0   # = SHIFT_S / SIM_TARGET_WALL_S
 SIM_GUI_INTERVAL_S:   float = 5.0     # refresh GUI every 5 simulated seconds
-SIM_SEED_INTERVAL_S:  float = 81.1    # = 28800 / 355  seed offer interval (sim-s)
+# SIM_SEED_INTERVAL_S = CYCLE_S / N_MACHINES
+# where CYCLE_S = T_avg + PART_SETUP_TIME_S + PART_REMOVAL_TIME_S + PART_BUFFER_TIME_S
+#               = 324.5 + 60 + 60 + 60 = 504.5 s
+# parts/shift   = N x SHIFT_S / CYCLE_S = 4 x 28800 / 504.5 = 228
+# interval      = CYCLE_S / N           = 504.5 / 4          = 126.1 sim-s
+SIM_SEED_INTERVAL_S:  float = 126.1   # sim-s between seed offers  (= CYCLE_S / N)
 SIM_GUI_MAX_FPS:      int   = 30      # hard cap on GUI repaint rate (wall clock)
 
 # ── Seed generation ───────────────────────────────────────────────────
@@ -177,8 +182,9 @@ MAX_REMINDERS: int = 4
 
 # ── CNC Agent — part timing ───────────────────────────────────────────────────
 TOOL_CHANGE_TIME_S:  float = 120.0   # seconds to swap a tool
-PART_SETUP_TIME_S:   float = 10.0   # seconds to fixture and zero a part
-PART_REMOVAL_TIME_S: float =  5.0   # seconds to unload a finished part
+PART_SETUP_TIME_S:   float = 60.0   # seconds to clamp and fixture a part (1 min)
+PART_REMOVAL_TIME_S: float = 60.0   # seconds to unclamp and remove a part  (1 min)
+PART_BUFFER_TIME_S:  float = 60.0   # contingency per cycle: tool change, inspection etc.
 MANUAL_OVERRIDE_PCT: float = 100.0   # feed-rate override (100 % = nominal)
 
 # ── Cost / amortisation ───────────────────────────────────────────────────────
