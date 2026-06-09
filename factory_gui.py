@@ -907,12 +907,16 @@ class FactoryGUI(tk.Tk):
         self._seed_max_idx: int     = -1   # len(_seed_index) - 1
 
         # Probability of submitting a new seed on any given sim-step.
-        # p = N_MACHINES × SIM_DT_S / SIM_T_AVG_S  (Poisson, shift-balanced)
-        self._seed_prob: float = (
-            config.SIM_N_MACHINES
-            * config.SIM_DT_S
-            / config.SIM_T_AVG_S
-        )
+        #
+        #   parts_per_shift = N × SHIFT_S / T_avg
+        #   steps_per_shift = TARGET_WALL_S / SIM_DT_S   <- compressed time
+        #   p               = parts_per_shift / steps_per_shift
+        #
+        _parts = (config.SIM_N_MACHINES
+                  * config.SIM_SHIFT_HOURS * 3600.0
+                  / config.SIM_T_AVG_S)
+        _steps = config.SIM_TARGET_WALL_S / config.SIM_DT_S
+        self._seed_prob: float = _parts / _steps
 
         # Completed parts log
         self._completed_parts: list[dict] = []

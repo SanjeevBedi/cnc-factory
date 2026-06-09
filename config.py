@@ -71,21 +71,23 @@ SIM_GUI_STEPS:   int   = 63        # repaint every N sim-steps  (~15 fps at 1×)
 SIM_GUI_MAX_FPS: int   = 30        # hard cap: never repaint faster than this
 
 # ── Seed generation probability ──────────────────────────────────────────────
-# Each sim-tick a single random draw decides whether to submit a new seed.
-# Probability is set so the expected number of submissions per shift exactly
-# matches the maximum throughput of the factory (ignoring clamp/unclamp):
+# Each sim-tick a single Poisson draw decides whether to submit a new seed.
 #
-#   max_parts   = N_MACHINES × SHIFT_HOURS × 3600 / SIM_T_AVG_S  = 355
-#   total_ticks = SHIFT_HOURS × 3600 / SIM_DT_S                   = 27 169 811
-#   p           = max_parts / total_ticks
-#               = N_MACHINES × SIM_DT_S / SIM_T_AVG_S             = 1.307e-5
+# Derivation:
+#   parts_per_shift = N_MACHINES × SHIFT_S / T_avg         = 355 parts
+#   steps_per_shift = SIM_TARGET_WALL_S / SIM_DT_S          = 169 811 ticks
+#   p               = parts_per_shift / steps_per_shift      = 0.00209
 #
-# Safety cap: submission is skipped when the scheduler queue already
-# holds SIM_MAX_QUEUE_AHEAD or more unassigned jobs.
-SIM_T_AVG_S:         float = 324.5   # measured mean machining time (s), cm→mm
-SIM_SHIFT_HOURS:     float = 8.0     # shift length (hours)
-SIM_N_MACHINES:      int   = 4       # number of CNC machines
-SIM_MAX_QUEUE_AHEAD: int   = 8       # safety cap on scheduler queue depth
+# The key: steps_per_shift uses the COMPRESSED wall time (3 min),
+# not the real shift duration (8 h).  Using real shift duration gives
+# p 160x too small, leaving machines idle 99% of the time.
+#
+# Safety cap: skip if scheduler queue >= SIM_MAX_QUEUE_AHEAD jobs.
+SIM_T_AVG_S:          float = 324.5   # measured mean machining time (s), cm→mm
+SIM_SHIFT_HOURS:      float = 8.0     # shift length (hours)
+SIM_N_MACHINES:       int   = 4       # number of CNC machines
+SIM_TARGET_WALL_S:    float = 180.0   # wall-clock seconds for one full shift
+SIM_MAX_QUEUE_AHEAD:  int   = 8       # safety cap on scheduler queue depth
 
 # ── Feature Extractor ─────────────────────────────────────────────────────────
 # A face with normal.z > this is a TOP face (machined from above)
