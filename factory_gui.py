@@ -1236,9 +1236,11 @@ class FactoryGUI(tk.Tk):
                 if sm.current_job and sm.current_job.job_id not in self._anim_seen:
                     self._anim_seen.add(sm.current_job.job_id)
                     self._anim_queues[mid].append(sm.current_job)
-            # Same-tick completions (est_time < T_UNIT so job starts+ends in 1 tick)
+            # Jobs that completed THIS tick (est_time_s < T_UNIT means a job
+            # starts in tick N and finishes in tick N+1; checking started_at_tick
+            # always misses them because started!=finished.  Use finished_at_tick.
             for job in self.fa.scheduler.completed_jobs:
-                if (job.started_at_tick == tick_id
+                if (job.finished_at_tick == tick_id
                         and job.assigned_machine_id
                         and job.job_id not in self._anim_seen):
                     self._anim_seen.add(job.job_id)
