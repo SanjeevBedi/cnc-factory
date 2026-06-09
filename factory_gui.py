@@ -868,7 +868,12 @@ class FactoryGUI(tk.Tk):
         self._openai_key  = openai_key
         self._demo_break  = demo_break   # (machine_id, tick)
         self._running     = False
-        self._step_ms     = 400          # ms between G-code line advances
+        # ── Base time loop ─────────────────────────────────────────────
+        # _dt_s  = real seconds per sim-step at the current speed setting.
+        # At 1× it equals config.SIM_DT_S (default 1.0 s).
+        # All durations expressed in sim-steps derive from config.SIM_DT_S
+        # so they stay meaningful regardless of the speed slider position.
+        self._dt_s: float = config.SIM_DT_S       # updated by _on_speed
         self._eq: queue.Queue[GuiEvent]  = queue.Queue()
         self._gcode_cursors: dict[str, int]        = {}
         self._gcode_lines:   dict[str, list[str]]  = {}
@@ -884,7 +889,9 @@ class FactoryGUI(tk.Tk):
         # dict: mid → {"job": job, "steps": int}
         self._unclamp: dict[str, Optional[dict]] = {}
         # Steps for visual unclamp phase (proportional to PART_REMOVAL_TIME_S)
-        self._UNCLAMP_STEPS: int = max(5, int(config.PART_REMOVAL_TIME_S / 20))
+        # Unclamp duration in sim-steps (derived from base dt).
+        # At 1× (dt=1 s): 120 steps = 120 real seconds of part removal.
+        self._UNCLAMP_STEPS: int = round(config.PART_REMOVAL_TIME_S / config.SIM_DT_S)
 
         # Indexed solid library — built once on first Load Seeds press.
         # Index i → seed value.  Random index selection allows repeats.
@@ -972,10 +979,10 @@ class FactoryGUI(tk.Tk):
         # At 1×: step_ms = 1500 ms  →  20-line job takes 30 s real.
         # At 10×: step_ms = 150 ms  →  same job takes  3 s real.
         # At 0.1×: step_ms = 15000 ms → same job takes 300 s real.
-        self._BASE_MS_PER_LINE: int   = 1500
-        self._speed_var = tk.DoubleVar(value=1.0)   # 0.1 … 10  (linear)
-        self._step_ms   = self._BASE_MS_PER_LINE     # set by _on_speed
-        self._speed_lbl = tk.Label(top, text="1.0×",
+        # Speed slider: 0.1× … 10×  (linear, direct multiplier of 1/dt)
+        # Label shows current speed and the resulting dt.
+        self._speed_var = tk.DoubleVar(value=1.0)
+        self._speed_lbl = tk.Label(top, text=f"1.0×  dt={config.SIM_DT_S:.2f}s",
                                    bg="#0d1117", fg=DIM, font=("Courier", 9))
         self._speed_lbl.pack(side="right", padx=(0, 2))
         tk.Label(top, text="speed:", bg="#0d1117", fg=DIM,
@@ -1180,35 +1187,50 @@ class FactoryGUI(tk.Tk):
 
     def _on_speed(self, _=None) -> None:
         """
-        Real-time speed control.
+        Speed control -- scales the base sim dt.
 
-        Slider  : 0.1 ... 10.0  (direct speed multiplier)
-        1.0x    : step_ms = BASE_MS_PER_LINE  (1 G-code line per 1.5 s wall time)
-        10.0x   : step_ms = BASE_MS_PER_LINE / 10  (10x faster than real)
-        0.1x    : step_ms = BASE_MS_PER_LINE x 10  (10x slower than real)
+        Slider : 0.1× … 10×   (linear, direct multiplier)
 
-        A 20-line job at 1x takes 30 s wall time -- matching estimated_time_s.
+        dt (real seconds per sim-step) = SIM_DT_S / speed
+
+          speed  dt        20-line job
+          -----  --------  -----------
+          0.1×   10.00 s   200 s wall
+          0.5×    2.00 s    40 s wall
+          1.0×    1.00 s    20 s wall   ← base (SIM_DT_S)
+          2.0×    0.50 s    10 s wall
+          5.0×    0.20 s     4 s wall
+          10×     0.10 s     2 s wall
         """
         speed = max(0.1, min(10.0, self._speed_var.get()))
-        self._step_ms = max(1, int(self._BASE_MS_PER_LINE / speed))
-        self._speed_lbl.configure(text=f"{speed:.1f}x")
+        self._dt_s = config.SIM_DT_S / speed
+        self._speed_lbl.configure(text=f"{speed:.1f}×  dt={self._dt_s:.2f}s")
 
     def _sim_loop(self) -> None:
+        """
+        Main simulation loop.  Sleeps for _dt_s seconds between steps.
+        _dt_s = config.SIM_DT_S / speed  (set by _on_speed).
+        Everything inside _do_sim_step advances by exactly one sim-step
+        (one G-code line, one scheduler sub-tick, one unclamp count-down tick).
+        """
         while self._running:
             self._do_sim_step()
-            time.sleep(self._step_ms / 1000.0)
+            time.sleep(self._dt_s)
 
     def _do_sim_step(self) -> None:
         """
-        One visual simulation step (called every `_step_ms` ms).
+        One sim-step -- called every _dt_s seconds by _sim_loop.
 
-        1. Run factory tick (scheduler assigns jobs, error protocol).
-        2. Capture any newly-assigned jobs into per-machine animation queues.
-        3. Start animating the next queued job if the canvas is idle.
-        4. Advance the G-code cursor one line per machine.
-        5. Detect animation completion → record finished job, clear canvas.
-        6. Auto-generate new seeds by probability.
-        7. Post GUI update events.
+        Each step represents one base time unit (config.SIM_DT_S at 1x speed):
+          1. Scheduler tick  -- fa.tick() advances job assignments/completions.
+          2. Capture jobs    -- newly assigned jobs enter per-machine anim queues.
+          3. Start anim      -- if canvas idle and queue non-empty, load next job.
+          4. Advance cursor  -- move one G-code line forward.
+          5a. Anim complete  -- enter unclamp countdown (_UNCLAMP_STEPS steps).
+          5b. Unclamp tick   -- count down; on zero, free scheduler + clear canvas.
+          7. Overflow guard  -- pause if any anim queue > 10 parts.
+          8. Auto-seed       -- pre-queue jobs to keep machines fed.
+          9. GUI events      -- post KPI + machine-state updates.
         """
         # demo break injection
         if self._demo_break:

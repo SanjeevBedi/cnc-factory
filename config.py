@@ -51,6 +51,18 @@ SEED_CREATION_PROB: float = 0.002 / 100   # 2e-5  (×10 vs previous 2e-6)
 # Duration of one scheduler tick (seconds)
 T_UNIT_SECONDS: int = 60
 
+# ── Simulation time base ────────────────────────────────────────────────────
+# SIM_DT_S is the canonical heartbeat of the simulation loop at 1× speed.
+# One sim step = one G-code line animated = SIM_DT_S real seconds at 1×.
+# Speed slider (0.1× … 10×) scales the actual sleep to SIM_DT_S / speed.
+#
+# Derived quantities (all in sim-steps, independent of real-time speed):
+#   UNCLAMP_STEPS = round(PART_REMOVAL_TIME_S / SIM_DT_S)   =   5 steps
+#   SETUP_STEPS   = round(PART_SETUP_TIME_S   / SIM_DT_S)   =  10 steps
+#
+# At 1× speed a 20-line job takes 20 s real; at 10× the same job takes 2 s.
+SIM_DT_S: float = 1.0   # seconds per sim-step at 1× speed
+
 # ── Feature Extractor ─────────────────────────────────────────────────────────
 # A face with normal.z > this is a TOP face (machined from above)
 NORMAL_UP_THRESHOLD: float = 0.9
@@ -127,8 +139,8 @@ MAX_REMINDERS: int = 4
 
 # ── CNC Agent — part timing ───────────────────────────────────────────────────
 TOOL_CHANGE_TIME_S:  float = 120.0   # seconds to swap a tool
-PART_SETUP_TIME_S:   float = 300.0   # seconds to fixture and zero a part
-PART_REMOVAL_TIME_S: float = 120.0   # seconds to unload a finished part
+PART_SETUP_TIME_S:   float = 10.0   # seconds to fixture and zero a part
+PART_REMOVAL_TIME_S: float =  5.0   # seconds to unload a finished part
 MANUAL_OVERRIDE_PCT: float = 100.0   # feed-rate override (100 % = nominal)
 
 # ── Cost / amortisation ───────────────────────────────────────────────────────
