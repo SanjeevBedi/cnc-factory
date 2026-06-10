@@ -1632,7 +1632,7 @@ class FactoryGUI(tk.Tk):
                     if cmd.action == "tool_removed_no_stock":
                         p2 = cmd.payload
                         self._fpanel.log(
-                            f"🚫 {mid} {tool_id} Ø{p2.get("diameter_mm",0):.0f}mm "
+                            f"🚫 {mid} {tool_id} Ø{p2.get('diameter_mm',0):.0f}mm "
                             f"removed — no stock.  "
                             f"Machine continues on remaining tools.", "warn")
                         self._trigger_replan(mid)   # re-CAM queued jobs without this tool
