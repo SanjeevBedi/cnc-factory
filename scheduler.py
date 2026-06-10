@@ -78,6 +78,12 @@ class Job:
     # None until the CAM pipeline completes.
     toolpath_result:    object = None   # ToolpathResult | None
 
+    # Tool actually selected from the machine’s crib for this job.
+    # Set by factory_agent.build_job_from_seed(); used by the GUI to
+    # deplete the correct ToolRecord when the job completes.
+    tool_id_used:       str   = ""     # e.g. "T2"
+    tool_diameter_used: float = 0.0    # mm — for log / KPI display
+
     # Runtime fields (set by Scheduler)
     status:             str   = "queued"   # queued | running | done | failed
     assigned_machine_id: Optional[str] = None

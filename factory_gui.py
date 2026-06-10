@@ -1187,11 +1187,19 @@ class FactoryGUI(tk.Tk):
             progress_cb = (win.progress
                            if win and win.winfo_exists() else None)
 
-            # ── Phase 1: run CAM pipeline (solid → G-code) ────────────────
-            # The job is NOT in the queue yet at this point.
+            # ── Phase 1: choose machine first, then run CAM ────────────────
+            # Knowing the machine upfront lets build_job_from_seed() use
+            # that machine's crib for correct tool selection.
+            dest = self._route_dest_only()
+            if dest is None:
+                self._fpanel.log(
+                    f"⚠ Seed {seed}: no enabled machines — discarded.", "warn")
+                continue
+
             job = self.fa.build_job_from_seed(
                 seed,
-                progress_cb=progress_cb,
+                machine_id  = dest,
+                progress_cb = progress_cb,
             )
 
             if job is None:
@@ -1199,11 +1207,7 @@ class FactoryGUI(tk.Tk):
                     f"⚠ CAM pipeline returned None for seed {seed}", "warn")
                 continue
 
-            dest = self._route_job(job)
-            if dest is None:
-                self._fpanel.log(
-                    f"⚠ Seed {seed}: no enabled machines — discarded.", "warn")
-                continue
+            self._msim[dest].queue.append(job)   # enqueue to pre-chosen machine
 
             self._fpanel.log(
                 f"📄 Seed {seed}  G-code ready  "
@@ -1396,6 +1400,18 @@ class FactoryGUI(tk.Tk):
             "total_s":     total_s,
             "tick_done":   tick_done,
         }
+        # Deplete the ToolRecord that actually ran this job.
+        tool_id = getattr(job, "tool_id_used", "")
+        tool_d  = getattr(job, "tool_diameter_used", 0.0)
+        if tool_id:
+            _agent = next((a for a in self.fa.agents if a.machine_id == mid), None)
+            if _agent is not None:
+                _tool_rec = _agent.tool_crib.get(tool_id)
+                if _tool_rec is not None:
+                    _tool_rec.deduct_life(mach_s)
+
+        stats["tool_id"]   = tool_id
+        stats["tool_d_mm"] = tool_d
         self._completed_parts.append(stats)
         self.fa.total_jobs_completed += 1   # scheduler bypassed; track manually
         # Update status in _all_jobs tracking list
@@ -1414,6 +1430,19 @@ class FactoryGUI(tk.Tk):
         )
 
     # ── Auto-seed generation ─────────────────────────────────────────────────
+
+    def _route_dest_only(self) -> "Optional[str]":
+        """
+        Choose the destination machine (shortest queue among enabled machines)
+        WITHOUT enqueuing a job.  Call this BEFORE build_job_from_seed() so
+        the correct machine's crib is used for tool selection.
+        Returns machine_id, or None if all machines are disabled.
+        """
+        eligible = [(mid, m) for mid, m in self._msim.items() if m.enabled]
+        if not eligible:
+            return None
+        mid, _ = min(eligible, key=lambda x: len(x[1].queue))
+        return mid
 
     def _route_job(self, job) -> "Optional[str]":
         """
@@ -1580,10 +1609,15 @@ class FactoryGUI(tk.Tk):
             progress_cb = (win.progress
                            if win and win.winfo_exists() else None)
 
-            # ── Phase 1: CAM pipeline ──────────────────────────────────────
+            # ── Phase 1: choose machine, then run CAM with its crib ────────
+            dest = self._route_dest_only()
+            if dest is None:
+                return   # all machines disabled
+
             job = self.fa.build_job_from_seed(
                 seed,
-                progress_cb=progress_cb,
+                machine_id  = dest,
+                progress_cb = progress_cb,
             )
 
             if job is None:
@@ -1593,10 +1627,7 @@ class FactoryGUI(tk.Tk):
                 )
                 return
 
-            # ── Phase 2: route to least-loaded enabled machine ──────────────
-            dest = self._route_job(job)
-            if dest is None:
-                return
+            self._msim[dest].queue.append(job)   # enqueue to pre-chosen machine
 
             self._fpanel.log(
                 f"📄 Auto-seed {seed}  G-code ready  "

@@ -457,6 +457,7 @@ class FactoryAgent:
     def build_job_from_seed(
         self,
         seed: int,
+        machine_id: Optional[str] = None,
         progress_cb: Optional[Callable] = None,
         generate_if_missing: bool = False,
     ) -> Optional[Job]:
@@ -529,22 +530,63 @@ class FactoryAgent:
                 f"{feat.n_top_faces} top faces  |  "
                 f"{getattr(feat, 'n_edges', '?')} edges labelled")
 
-            # ── Stage: feeds & speeds (random material assignment) ────────
+            # ── Stage: feeds & speeds ────────────────────────────────────────────
             from timing_model import assign_material, stamp_toolpath
             material = assign_material()
+
+            # Select the best tool from this machine's crib.
+            # Use the narrowest bounding-box side of the widest top face as
+            # the representative width; ToolCrib.select_for_face() picks the
+            # largest tool whose diameter < face_width / 4.
+            tool_diameter_mm = config.DEFAULT_TOOL_DIAMETER_MM
+            tool_flutes      = config.DEFAULT_TOOL_FLUTES
+            tool_type_sel    = config.DEFAULT_TOOL_TYPE
+            tool_id_used     = ""
+
+            if machine_id is not None:
+                _agent = next(
+                    (a for a in self.agents if a.machine_id == machine_id),
+                    None,
+                )
+                if _agent is not None:
+                    face_widths = []
+                    for tf in feat.top_faces:
+                        xs = [v[0] for v in tf.vertices_2d]
+                        ys = [v[1] for v in tf.vertices_2d]
+                        if xs and ys:
+                            face_widths.append(
+                                min(max(xs) - min(xs), max(ys) - min(ys))
+                            )
+                    rep_width = max(face_widths) if face_widths else 0.0
+                    _tool_rec = _agent.tool_crib.select_for_face(rep_width)
+                    if _tool_rec is not None:
+                        tool_diameter_mm = _tool_rec.diameter_mm
+                        tool_flutes      = _tool_rec.n_inserts
+                        tool_id_used     = _tool_rec.tool_id
+                        _cb("fs",
+                            f"Crib {machine_id}: selected "
+                            f"{_tool_rec.tool_id} Ø{_tool_rec.diameter_mm:.0f} mm  "
+                            f"({_tool_rec.n_inserts} inserts  "
+                            f"life={_tool_rec.remaining_life_pct:.0f}%)")
+                    else:
+                        _cb("fs",
+                            f"No usable tool in {machine_id} crib — "
+                            f"fallback Ø{tool_diameter_mm:.0f} mm")
+
             _cb("fs", f"Computing feeds/speeds  ({material})…")
             fs = fs_compute(
                 material,
-                config.DEFAULT_TOOL_DIAMETER_MM,
-                config.DEFAULT_TOOL_FLUTES,
-                tool_type       = config.DEFAULT_TOOL_TYPE,
-                axial_depth_mm  = 0.50 * config.DEFAULT_TOOL_DIAMETER_MM,
-                radial_depth_mm = 0.40 * config.DEFAULT_TOOL_DIAMETER_MM,
+                tool_diameter_mm,
+                tool_flutes,
+                tool_type       = tool_type_sel,
+                axial_depth_mm  = 0.50 * tool_diameter_mm,
+                radial_depth_mm = 0.40 * tool_diameter_mm,
             )
             _cb("fs",
                 f"RPM = {fs.rpm:.0f}  |  "
                 f"feed = {fs.feed_rate_mmpm:.0f} mm/min  |  "
-                f"power = {fs.power_kw:.2f} kW  |  mat = {material}")
+                f"power = {fs.power_kw:.2f} kW  |  "
+                f"mat = {material}  |  tool Ø{tool_diameter_mm:.0f} mm")
 
             # ── Stage: toolpath ───────────────────────────────────────────
             _cb("toolpath", "Planning raster toolpath…")
@@ -573,12 +615,14 @@ class FactoryAgent:
             # ── Build Job (NOT yet queued) ─────────────────────────────────
             job = job_from_gcode(gc)
             # Use the stamped machining time (material-aware).
-            job.estimated_time_s = max(t_mach_s, 1.0)
-            job.material         = material
+            job.estimated_time_s  = max(t_mach_s, 1.0)
+            job.material          = material
+            job.tool_id_used      = tool_id_used
+            job.tool_diameter_used = tool_diameter_mm
             # Attach the stamped ToolpathResult so the GUI tick-executor can
             # use waypoints_due() to advance the G-code cursor in real sim-time
             # instead of advancing by one line per tick.
-            job.toolpath_result  = tp
+            job.toolpath_result   = tp
             # job.status remains "queued" only after enqueue_job() is called;
             # set a sentinel so callers can distinguish CAM-ready from queued.
             job.status = "cam_ready"
