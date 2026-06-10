@@ -278,7 +278,22 @@ def generate(
     w.blank()
 
     # ── 5. Faces ──────────────────────────────────────────────────────────────
+    # Each face block is bracketed by structured sentinel comments so that
+    # the resume-after-tool-change logic can locate unmachined faces:
+    #
+    #   (FACE_START face_id=N z=Z.ZZZ passes=P entry=TYPE)
+    #   ... G-code for this face ...
+    #   (FACE_END face_id=N)
+    #
+    # These tokens survive any post-processing and allow a line-number scan
+    # to find the last FACE_END before the interrupted position.
     for ft in toolpath_result.faces:
+        # Structured start sentinel — machine-parseable
+        w.comment(
+            f"FACE_START face_id={ft.face_id} z={ft.z_height:.3f} "
+            f"passes={ft.n_passes} entry={ft.entry_type}"
+        )
+        # Human-readable detail on next line
         w.comment(
             f"Face {ft.face_id}  z={ft.z_height:.3f}mm  "
             f"passes={ft.n_passes}  entry={ft.entry_type}"
@@ -286,6 +301,7 @@ def generate(
 
         if ft.n_passes == 0:
             w.comment(f"  (skipped — {', '.join(ft.warnings) if ft.warnings else 'no passes'})")
+            w.comment(f"FACE_END face_id={ft.face_id}")
             w.blank()
             continue
 
@@ -300,6 +316,7 @@ def generate(
                 pass   # silent stay-down link
             _emit_pass(w, tp)
 
+        w.comment(f"FACE_END face_id={ft.face_id}")
         w.blank()
 
     # ── 6. End of program ─────────────────────────────────────────────────────

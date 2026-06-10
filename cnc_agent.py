@@ -103,7 +103,13 @@ class ToolRecord:
 
     @property
     def needs_replacement(self) -> bool:
+        """Below STOP_PCT: do not start a new operation with this tool."""
         return self.remaining_life_pct < config.TOOL_LIFE_STOP_PCT
+
+    @property
+    def needs_warn_replacement(self) -> bool:
+        """Below WARN_PCT but above STOP_PCT: replace at next part-load boundary."""
+        return self.remaining_life_pct < config.TOOL_LIFE_WARN_PCT
 
     def deduct_life(self, cutting_time_s: float) -> None:
         """Reduce remaining life by the cutting time used."""
@@ -180,9 +186,19 @@ class ToolCrib:
             return None
         return max(candidates, key=lambda t: t.diameter_mm)
 
-    def tools_needing_replacement(self) -> list[ToolRecord]:
+    def tools_at_warn(self) -> list[ToolRecord]:
+        """Life < WARN_PCT — replace at next part-load boundary."""
         return [t for t in self._tools.values()
-                if t.remaining_life_pct < config.TOOL_LIFE_WARN_PCT]
+                if t.needs_warn_replacement and not t.needs_replacement]
+
+    def tools_at_stop(self) -> list[ToolRecord]:
+        """Life < STOP_PCT — block new job start; change immediately."""
+        return [t for t in self._tools.values() if t.needs_replacement]
+
+    def tools_needing_replacement(self) -> list[ToolRecord]:
+        """Union: any tool below WARN_PCT (backward-compat for factory_agent)."""
+        return [t for t in self._tools.values()
+                if t.needs_warn_replacement or t.needs_replacement]
 
     def update_tool_from_factory(
         self, tool_id: str, new_tool: ToolRecord

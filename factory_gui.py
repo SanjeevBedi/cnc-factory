@@ -164,8 +164,12 @@ class _MachSim:
     unclamp_left: int    = 0
     gcode_lines:    list  = field(default_factory=list)
     gcode_cursor:   int   = 0
-    mach_start_tick: int  = 0      # sim tick when machining phase began
-    n_lines_done:   int   = 0      # captured at machining-complete
+    mach_start_tick: int  = 0       # sim tick when machining phase began
+    n_lines_done:   int   = 0       # captured at machining-complete
+    # Tool-change state
+    tool_change_left: int  = 0      # countdown ticks for changeover
+    tool_change_reason: str = ""    # "warn" | "stop" — for log/display
+    pending_replan:  bool  = False  # True when substitute tool needs re-CAM
 
 
 # ── 2-D G-code canvas ─────────────────────────────────────────────────────────
@@ -612,6 +616,12 @@ class MachinePanel(ttk.Frame):
     def set_setup_label(self, seed, steps_left: int) -> None:
         self._part_lbl.configure(
             text=f"🔧 Setup {seed}  ({steps_left} steps)", fg=ACCENT)
+
+    def set_tool_change_label(self, reason: str, ticks_left: int) -> None:
+        colour = RED if reason == "stop" else ORANGE
+        self._part_lbl.configure(
+            text=f"🔧 Tool change [{reason}]  ({ticks_left} ticks)",
+            fg=colour)
 
     def update_state(self, state: dict) -> None:
         status = state.get("status", "idle")
@@ -1431,6 +1441,97 @@ class FactoryGUI(tk.Tk):
 
     # ── Auto-seed generation ─────────────────────────────────────────────────
 
+    def _start_tool_change(
+        self, msim, mid: str, panel, reason: str
+    ) -> None:
+        """
+        Enter the tool_change countdown state.
+        reason = "warn"  (WARN_PCT: change at next part-load boundary)
+               = "stop"  (STOP_PCT: change immediately, block new jobs)
+        Downtime = config.TOOL_CHANGE_TIME_S ticks.
+        """
+        if msim.status == "tool_change":
+            return   # already counting down
+        ticks = max(1, round(config.TOOL_CHANGE_TIME_S / config.T_TICK_S))
+        msim.tool_change_left   = ticks
+        msim.tool_change_reason = reason
+        msim.status             = "tool_change"
+        colour = "stop — finish current op first" if reason == "stop" \
+                 else "warn — replace before next part"
+        self._fpanel.log(
+            f"🔧 {mid} tool change started [{colour}]  "
+            f"{ticks} ticks ({config.TOOL_CHANGE_TIME_S:.0f}s)", "warn")
+        if panel:
+            panel.set_tool_change_label(reason, ticks)
+
+    def _trigger_replan(
+        self, mid: str
+    ) -> None:
+        """
+        Called when a substitute tool was installed (different diameter).
+        For each job in the machine's queue, re-run CAM with the new tool.
+        For the current job (if in machining): identify completed faces from
+        gcode FACE_END labels and build a resume job for the rest.
+        """
+        import threading
+        threading.Thread(
+            target=self._replan_thread,
+            args=(mid,),
+            daemon=True,
+        ).start()
+
+    def _replan_thread(self, mid: str) -> None:
+        """
+        Background: regenerate G-code for queued jobs and the in-progress
+        job's remaining faces after a substitute tool installation.
+        """
+        msim = self._msim.get(mid)
+        if msim is None:
+            return
+
+        # ── 1. Resume job for currently-machining part ────────────────────
+        if msim.status == "machining" and msim.current_job is not None:
+            done_ids = self._completed_face_ids(msim)
+            resume   = self.fa.build_resume_job(
+                msim.current_job,
+                completed_face_ids = done_ids,
+                machine_id         = mid,
+            )
+            if resume is not None:
+                # Prepend the resume job so it runs immediately after
+                # the current op finishes and unclamp completes.
+                msim.queue.appendleft(resume)
+                self._fpanel.log(
+                    f"🔁 {mid} resume job queued  "
+                    f"({len(resume.gcode_lines)} lines  "
+                    f"{len(done_ids)} faces done)", "ok")
+
+        # ── 2. Replan queued jobs ────────────────────────────────────────
+        new_queue = deque()
+        for job in list(msim.queue):
+            replanned = self.fa.build_job_from_seed(
+                job.seed, machine_id=mid)
+            new_queue.append(replanned if replanned is not None else job)
+        msim.queue = new_queue
+        self._fpanel.log(
+            f"🔁 {mid} replan complete  "
+            f"{len(msim.queue)} queued job(s) replanned", "ok")
+
+    def _completed_face_ids(self, msim) -> set:
+        """
+        Parse the G-code lines up to the current cursor and return the set
+        of face_ids for which a FACE_END sentinel has already been passed.
+        FACE_END comments have the form:  (FACE_END face_id=N)
+        """
+        import re as _re
+        done = set()
+        pattern = _re.compile(r'\(FACE_END face_id=(\d+)\)')
+        for line in msim.gcode_lines[:msim.gcode_cursor]:
+            m = pattern.match(line.strip())
+            if m:
+                done.add(int(m.group(1)))
+        return done
+
     def _route_dest_only(self) -> "Optional[str]":
         """
         Choose the destination machine (shortest queue among enabled machines)
@@ -1460,19 +1561,31 @@ class FactoryGUI(tk.Tk):
         """
         Advance one machine through its lifecycle by one tick.
 
-            idle      — if queue non-empty, pop next job → setup
-            setup     — countdown setup ticks → machining
-            machining — at each tick compute elapsed_s = (cur_tick - mach_start_tick) × T_TICK_S;
-                          call waypoints_due(elapsed_s) to tag all waypoints whose
-                          t_end has passed; map done-fraction → G-code cursor;
-                          transition to unclamp when elapsed_s ≥ estimated_time_s
-            unclamp   — countdown unclamp ticks → idle + record completion
+            idle        — check for STOP_PCT tools; if any, enter tool_change first.
+                          Otherwise if queue non-empty, check WARN_PCT tools: if any,
+                          enter tool_change before loading next part.
+            tool_change — countdown tool_change_left ticks → idle
+            setup       — countdown setup ticks → machining
+            machining   — time-driven via waypoints_due(); → unclamp when done
+            unclamp     — countdown unclamp ticks → idle + record completion
         """
         mid   = msim.mid
         panel = self._panels.get(mid)
 
         if msim.status == "idle":
+            agent = next((a for a in self.fa.agents if a.machine_id == mid), None)
+
+            # ── STOP_PCT check: block new job start; change tool first ──
+            if agent and agent.tool_crib.tools_at_stop():
+                self._start_tool_change(msim, mid, panel, "stop")
+                return   # come back after countdown
+
             if msim.queue:
+                # ── WARN_PCT check: change tool before loading next part ──
+                if agent and agent.tool_crib.tools_at_warn():
+                    self._start_tool_change(msim, mid, panel, "warn")
+                    return   # come back after countdown
+
                 msim.current_job  = msim.queue.popleft()
                 msim.gcode_lines  = msim.current_job.gcode_lines
                 msim.gcode_cursor = 0
@@ -1480,6 +1593,20 @@ class FactoryGUI(tk.Tk):
                 msim.status       = "setup"
                 if panel:
                     panel.set_setup_label(msim.current_job.seed, msim.setup_left)
+
+        elif msim.status == "tool_change":
+            msim.tool_change_left -= 1
+            if panel:
+                panel._part_lbl.configure(
+                    text=f"🔧 Tool change  ({msim.tool_change_left} ticks)",
+                    fg=ORANGE)
+            if msim.tool_change_left <= 0:
+                msim.status = "idle"
+                if panel:
+                    panel.set_idle_label()
+                self._fpanel.log(
+                    f"✅ {mid} tool change complete "
+                    f"({msim.tool_change_reason})", "ok")
 
         elif msim.status == "setup":
             msim.setup_left -= 1
@@ -2125,9 +2252,28 @@ class FactoryGUI(tk.Tk):
             self._fpanel.update_kpis(kpis, tick)
             self._tick_lbl.configure(text=f"tick {tick}")
             for cmd in ev.data.get("cmds", []):
-                tag = "warn" if cmd["action"] in ("abort","rework") else "ok"
-                self._fpanel.log(
-                    f"CMD → {cmd['mid']} : {cmd['action']}", tag)
+                _tool_actions = ("replace_tool", "tool_out_of_stock")
+                if cmd["action"] == "tool_out_of_stock":
+                    tag = "warn"
+                    self._fpanel.log(
+                        f"⚠ {cmd['mid']} — tool out of stock: "
+                        f"{cmd.get('payload', {}).get('tool_id', '?')}  "
+                        "NO replacement available — machine will stall", "warn")
+                elif cmd["action"] == "replace_tool":
+                    p   = cmd.get("payload", {})
+                    tag = "warn" if p.get("urgency") == "stop" else "ok"
+                    sub = " (SUBSTITUTE Ø{:.0f}mm)".format(p["diameter_mm"]) \
+                          if p.get("substitute") else ""
+                    self._fpanel.log(
+                        f"🔧 {cmd['mid']} tool change: "
+                        f"{p.get('tool_id','?')} → {p.get('new_tool_id','?')}"
+                        f"{sub}  [{p.get('urgency','warn')}]", tag)
+                    if p.get("needs_replanning"):
+                        self._trigger_replan(cmd["mid"])
+                else:
+                    tag = "warn" if cmd["action"] in ("abort", "rework") else "ok"
+                    self._fpanel.log(
+                        f"CMD → {cmd['mid']} : {cmd['action']}", tag)
 
         elif kind == "chat_append":
             panel = self._panels.get(mid)

@@ -238,7 +238,9 @@ ERROR_WAIT_TICKS: int = 10
 MAX_REMINDERS: int = 4
 
 # ── CNC Agent — part timing (all in simulated seconds) ──────────────────────────────────
-TOOL_CHANGE_TIME_S:  float = 120.0   # seconds to swap a tool
+TOOL_CHANGE_TIME_S:  float = 150.0   # seconds to swap a tool (2.5 min)
+# WARN_PCT: replace at next part-load boundary (half the change time)
+# STOP_PCT: block new job start; finish current op then change tool
 PART_SETUP_TIME_S:   float = 120.0   # seconds to clamp and fixture a part  (2 min)
 PART_REMOVAL_TIME_S: float = 120.0   # seconds to unclamp and remove a part (2 min)
 PART_BUFFER_TIME_S:  float =  60.0   # contingency per cycle

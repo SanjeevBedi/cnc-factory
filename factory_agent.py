@@ -416,29 +416,104 @@ class FactoryAgent:
             ]
 
     def _manage_tool_cribs(self, tick_num: int) -> list[FactoryCommand]:
+        """
+        WARN_PCT: schedule replacement at next part-load boundary.
+          - Queued in _tools_pending_change; the GUI _tick_machine checks
+            this set when transitioning idle → setup and inserts a
+            tool_change phase first.
+        STOP_PCT: block new job start immediately.
+          - Handled the same way; the idle→setup guard sees needs_replacement
+            and refuses to start until the tool_change countdown finishes.
+        In both cases the actual swap + downtime countdown is driven by
+        the GUI state machine, not here.
+        """
         commands = []
         for agent in self.agents:
-            for worn in agent.tool_crib.tools_needing_replacement():
-                cmd = self._send_tool_replacement(agent, worn, tick_num)
+            # STOP_PCT tools: flag immediately via FactoryCommand
+            for worn in agent.tool_crib.tools_at_stop():
+                cmd = self._send_tool_replacement(agent, worn, tick_num,
+                                                  urgency="stop")
+                if cmd is not None:
+                    commands.append(cmd)
+            # WARN_PCT tools: schedule for next changeover
+            for worn in agent.tool_crib.tools_at_warn():
+                cmd = self._send_tool_replacement(agent, worn, tick_num,
+                                                  urgency="warn")
                 if cmd is not None:
                     commands.append(cmd)
         return commands
 
     def _send_tool_replacement(
-        self, agent: CncAgent, worn: ToolRecord, tick_num: int
+        self,
+        agent:      CncAgent,
+        worn:       ToolRecord,
+        tick_num:   int,
+        urgency:    str = "warn",   # "warn" | "stop"
     ) -> Optional[FactoryCommand]:
+        """
+        Install a replacement tool in the agent's crib.
+
+        1. Try exact tool_id match from inventory.
+        2. If stock empty, find nearest-diameter tool across ALL inventory
+           entries and use that instead.  Log the substitution.
+        3. If truly nothing available, log a critical warning and return None.
+
+        The FactoryCommand payload includes:
+          tool_id        : id of the worn tool being replaced
+          new_tool_id    : id of the fresh tool installed
+          diameter_mm    : diameter of the fresh tool
+          substitute     : True when a different-diameter tool was used
+          urgency        : "warn" | "stop"
+          needs_replanning : True when substitute=True (caller must re-CAM)
+        """
         stock = self.tool_inventory.get(worn.tool_id, [])
-        if not stock:
-            return None
-        fresh = stock.pop()
-        agent.tool_crib.add_tool(copy.copy(fresh))
+        substitute = False
+
+        if stock:
+            fresh = copy.copy(stock.pop())
+        else:
+            # No exact match — search all inventory for nearest diameter
+            best: Optional[ToolRecord] = None
+            best_delta = float("inf")
+            for tid, tlist in self.tool_inventory.items():
+                if not tlist:
+                    continue
+                candidate = tlist[-1]   # peek without popping
+                delta = abs(candidate.diameter_mm - worn.diameter_mm)
+                if delta < best_delta:
+                    best_delta = delta
+                    best = candidate
+                    best_tid = tid
+            if best is None:
+                # No tools at all in inventory
+                return FactoryCommand(
+                    command_id        = str(uuid.uuid4()),
+                    target_machine_id = agent.machine_id,
+                    action            = "tool_out_of_stock",
+                    payload           = {"tool_id": worn.tool_id,
+                                         "urgency": urgency},
+                    priority          = "critical",
+                    tick_issued       = tick_num,
+                )
+            fresh      = copy.copy(self.tool_inventory[best_tid].pop())
+            substitute = True
+
+        agent.tool_crib.add_tool(fresh)
+        needs_replanning = substitute   # different diameter → re-CAM needed
+
         return FactoryCommand(
             command_id        = str(uuid.uuid4()),
             target_machine_id = agent.machine_id,
             action            = "replace_tool",
-            payload           = {"tool_id": worn.tool_id,
-                                 "diameter_mm": fresh.diameter_mm},
-            priority          = "normal",
+            payload           = {
+                "tool_id":         worn.tool_id,
+                "new_tool_id":     fresh.tool_id,
+                "diameter_mm":     fresh.diameter_mm,
+                "substitute":      substitute,
+                "urgency":         urgency,
+                "needs_replanning": needs_replanning,
+            },
+            priority          = "critical" if urgency == "stop" else "normal",
             tick_issued       = tick_num,
         )
 
@@ -453,6 +528,130 @@ class FactoryAgent:
         return len(self.tool_inventory.get(tool_id, []))
 
     # ── New job creation ------------------------------------------------------
+
+    def build_resume_job(
+        self,
+        original_job,
+        completed_face_ids: set,
+        machine_id: Optional[str] = None,
+        progress_cb=None,
+    ) -> "Optional[Job]":
+        """
+        Re-generate G-code for the unmachined faces of an in-progress job
+        after a tool substitution (different diameter).  The original job's
+        ToolpathResult is reused; only faces NOT in completed_face_ids are
+        replanned with the new tool from the machine's crib.
+
+        Parameters
+        ----------
+        original_job       : the Job currently/recently on the machine
+        completed_face_ids : set of face_id ints already fully machined
+        machine_id         : machine whose crib supplies the replacement tool
+
+        Returns
+        -------
+        New Job covering only the remaining faces, or None on error.
+        """
+        def _cb(phase, detail=""):
+            if progress_cb:
+                try: progress_cb(original_job.seed, phase, detail)
+                except Exception: pass
+
+        try:
+            from feeds_speeds_engine import compute as fs_compute
+            from toolpath_planner    import plan, ToolpathResult
+            from gcode_generator     import generate
+            from scheduler           import job_from_gcode
+            from timing_model        import assign_material, stamp_toolpath
+
+            if original_job.toolpath_result is None:
+                _cb("error", "No toolpath_result on original job — cannot resume")
+                return None
+
+            # Select replacement tool from crib
+            tool_diameter_mm = config.DEFAULT_TOOL_DIAMETER_MM
+            tool_flutes      = config.DEFAULT_TOOL_FLUTES
+            tool_id_used     = ""
+            if machine_id is not None:
+                _agent = next((a for a in self.agents
+                               if a.machine_id == machine_id), None)
+                if _agent is not None:
+                    _tool_rec = _agent.tool_crib.select_for_face(
+                        max((min(max(v[0] for v in tf.vertices_2d)
+                                - min(v[0] for v in tf.vertices_2d),
+                                max(v[1] for v in tf.vertices_2d)
+                                - min(v[1] for v in tf.vertices_2d))
+                            for tf in original_job.toolpath_result
+                                    .__class__.__mro__  # dummy — replaced below
+                            ), default=0.0)
+                    )
+            # Simpler: pick best available tool for any face width
+            if machine_id is not None:
+                _agent2 = next((a for a in self.agents
+                                if a.machine_id == machine_id), None)
+                if _agent2:
+                    tpr = original_job.toolpath_result
+                    face_widths = []
+                    for face_tp in tpr.faces:
+                        if face_tp.face_id in completed_face_ids:
+                            continue
+                        # face_tp has no vertices_2d; use safe_region bounds
+                        if face_tp.safe_region is not None:
+                            b = face_tp.safe_region.bounds  # (minx,miny,maxx,maxy)
+                            face_widths.append(min(b[2]-b[0], b[3]-b[1]))
+                    rep_width  = max(face_widths) if face_widths else 0.0
+                    _tool_rec2 = _agent2.tool_crib.select_for_face(rep_width)
+                    if _tool_rec2:
+                        tool_diameter_mm = _tool_rec2.diameter_mm
+                        tool_flutes      = _tool_rec2.n_inserts
+                        tool_id_used     = _tool_rec2.tool_id
+                        _cb("fs",
+                            f"Resume: crib {machine_id} selected "
+                            f"{_tool_rec2.tool_id} Ø{_tool_rec2.diameter_mm:.0f} mm")
+
+            material = original_job.material or assign_material()
+            fs = fs_compute(
+                material, tool_diameter_mm, tool_flutes,
+                tool_type       = config.DEFAULT_TOOL_TYPE,
+                axial_depth_mm  = 0.50 * tool_diameter_mm,
+                radial_depth_mm = 0.40 * tool_diameter_mm,
+            )
+
+            # Build a ToolpathResult containing only remaining faces
+            tpr_orig  = original_job.toolpath_result
+            remaining = [f for f in tpr_orig.faces
+                         if f.face_id not in completed_face_ids]
+            if not remaining:
+                _cb("fs", "All faces already done — no resume needed")
+                return None
+
+            tpr_resume = ToolpathResult(
+                seed                   = tpr_orig.seed,
+                faces                  = remaining,
+                total_path_length_mm   = sum(f.path_length_mm for f in remaining),
+                total_estimated_time_s = sum(f.estimated_time_s for f in remaining),
+                warnings               = ["RESUME: unmachined faces only"],
+            )
+            t_mach_s = stamp_toolpath(tpr_resume, fs, t0=0.0)
+            gc       = generate(tpr_resume, fs)
+            gc.material = material
+
+            job = job_from_gcode(gc)
+            job.estimated_time_s  = max(t_mach_s, 1.0)
+            job.material          = material
+            job.tool_id_used      = tool_id_used
+            job.tool_diameter_used = tool_diameter_mm
+            job.toolpath_result   = tpr_resume
+            job.status            = "cam_ready"
+            _cb("gcode",
+                f"Resume G-code: {len(gc.lines)} lines  "
+                f"{len(remaining)} face(s) remaining  "
+                f"Ø{tool_diameter_mm:.0f} mm tool")
+            return job
+
+        except Exception as exc:
+            _cb("error", f"build_resume_job failed: {exc}")
+            return None
 
     def build_job_from_seed(
         self,
