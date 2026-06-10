@@ -1379,7 +1379,9 @@ class FactoryGUI(tk.Tk):
         a wall-clock timer so the GUI repaint rate is capped at SIM_GUI_MAX_FPS
         regardless of how fast the sim-loop is running."""
         result = self._last_result
-        cmds   = ([{"mid": c.target_machine_id, "action": c.action}
+        cmds   = ([{"mid": c.target_machine_id,
+                             "action":  c.action,
+                             "payload": c.payload}
                    for c in result.commands_sent]
                   if result else [])
         self._eq.put(GuiEvent("factory_update", "factory", {
@@ -1627,11 +1629,13 @@ class FactoryGUI(tk.Tk):
                     if cmd is None:
                         continue
                     p   = cmd.payload
-                    if cmd.action == "tool_out_of_stock":
+                    if cmd.action == "tool_removed_no_stock":
+                        p2 = cmd.payload
                         self._fpanel.log(
-                            f"⚠ {mid} {tool_id} — NO stock "
-                            f"[{msim.tool_change_reason}] machine will stall",
-                            "warn")
+                            f"🚫 {mid} {tool_id} Ø{p2.get("diameter_mm",0):.0f}mm "
+                            f"removed — no stock.  "
+                            f"Machine continues on remaining tools.", "warn")
+                        self._trigger_replan(mid)   # re-CAM queued jobs without this tool
                     else:
                         sub = (f" (SUBSTITUTE Ø{p['diameter_mm']:.0f}mm)"
                                if p.get("substitute") else "")
@@ -2293,15 +2297,20 @@ class FactoryGUI(tk.Tk):
             self._tick_lbl.configure(text=f"tick {tick}")
             for cmd in ev.data.get("cmds", []):
                 if cmd["action"] in ("tool_worn_stop", "tool_worn_warn"):
-                    # Detection-only signal from _manage_tool_cribs
-                    # — actual swap happens at end of tool_change countdown
-                    urgency = "stop" if cmd["action"] == "tool_worn_stop" else "warn"
-                    p       = cmd.get("payload", {})
-                    tag     = "warn" if urgency == "stop" else "ok"
-                    self._fpanel.log(
-                        f"🔴 {cmd['mid']} {p.get('tool_id','?')} "
-                        f"life={p.get('life_pct',0):.1f}% "
-                        f"[≥ {urgency.upper()} threshold]", tag)
+                    # Suppress if this machine is already handling a tool_change
+                    # — _manage_tool_cribs fires every tick, so without this
+                    # the log floods with 30 identical entries per cycle.
+                    _msim_chk = self._msim.get(cmd["mid"])
+                    if _msim_chk and _msim_chk.status == "tool_change":
+                        pass   # already counting down — stay quiet
+                    else:
+                        urgency = "stop" if cmd["action"] == "tool_worn_stop" else "warn"
+                        p       = cmd.get("payload", {})
+                        tag     = "warn" if urgency == "stop" else "ok"
+                        self._fpanel.log(
+                            f"🔴 {cmd['mid']} {p.get('tool_id','?')} "
+                            f"life={p.get('life_pct',0):.1f}% "
+                            f"[≥ {urgency.upper()} threshold]", tag)
                 elif cmd["action"] == "tool_out_of_stock":
                     tag = "warn"
                     self._fpanel.log(

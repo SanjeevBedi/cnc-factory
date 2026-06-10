@@ -460,7 +460,8 @@ class FactoryAgent:
 
         1. Exact tool_id match from inventory.
         2. Nearest-diameter substitute if exact stock is empty.
-        3. tool_out_of_stock FactoryCommand if nothing at all available.
+        3. tool_removed_no_stock FactoryCommand if nothing available — worn
+           tool is removed from the crib so the machine runs on remaining tools.
         """
         stock = self.tool_inventory.get(worn.tool_id, [])
         substitute = False
@@ -481,13 +482,17 @@ class FactoryAgent:
                     best = candidate
                     best_tid = tid
             if best is None:
-                # No tools at all in inventory
+                # No tools anywhere in inventory — remove the worn tool
+                # from the crib so the machine runs on its remaining tools.
+                # The GUI will trigger a replan for queued jobs.
+                agent.tool_crib.remove_tool(worn.tool_id)
                 return FactoryCommand(
                     command_id        = str(uuid.uuid4()),
                     target_machine_id = agent.machine_id,
-                    action            = "tool_out_of_stock",
-                    payload           = {"tool_id": worn.tool_id,
-                                         "urgency": urgency},
+                    action            = "tool_removed_no_stock",
+                    payload           = {"tool_id":  worn.tool_id,
+                                         "urgency":  urgency,
+                                         "diameter_mm": worn.diameter_mm},
                     priority          = "critical",
                     tick_issued       = tick_num,
                 )
