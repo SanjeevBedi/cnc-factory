@@ -167,9 +167,10 @@ class _MachSim:
     mach_start_tick: int  = 0       # sim tick when machining phase began
     n_lines_done:   int   = 0       # captured at machining-complete
     # Tool-change state
-    tool_change_left: int  = 0      # countdown ticks for changeover
-    tool_change_reason: str = ""    # "warn" | "stop" — for log/display
-    pending_replan:  bool  = False  # True when substitute tool needs re-CAM
+    tool_change_left:   int  = 0      # countdown ticks for changeover
+    tool_change_reason: str  = ""     # "warn" | "stop" — for log/display
+    worn_tool_ids:      list = field(default_factory=list)  # tool_ids to swap at end of countdown
+    pending_replan:     bool = False  # True when substitute tool needs re-CAM
 
 
 # ── 2-D G-code canvas ─────────────────────────────────────────────────────────
@@ -1418,7 +1419,7 @@ class FactoryGUI(tk.Tk):
             if _agent is not None:
                 _tool_rec = _agent.tool_crib.get(tool_id)
                 if _tool_rec is not None:
-                    _tool_rec.deduct_life(mach_s)
+                    _tool_rec.deduct_life(mach_s * config.TOOL_LIFE_DEPLETION_MULT)
 
         stats["tool_id"]   = tool_id
         stats["tool_d_mm"] = tool_d
@@ -1452,6 +1453,16 @@ class FactoryGUI(tk.Tk):
         """
         if msim.status == "tool_change":
             return   # already counting down
+        # Snapshot which tools are worn RIGHT NOW — the actual swap happens
+        # at the END of the countdown so downtime is real.
+        agent = next((a for a in self.fa.agents if a.machine_id == mid), None)
+        if agent:
+            worn = (agent.tool_crib.tools_at_stop()
+                    if reason == "stop"
+                    else agent.tool_crib.tools_at_warn())
+            msim.worn_tool_ids = [t.tool_id for t in worn]
+        else:
+            msim.worn_tool_ids = []
         ticks = max(1, round(config.TOOL_CHANGE_TIME_S / config.T_TICK_S))
         msim.tool_change_left   = ticks
         msim.tool_change_reason = reason
@@ -1601,12 +1612,41 @@ class FactoryGUI(tk.Tk):
                     text=f"🔧 Tool change  ({msim.tool_change_left} ticks)",
                     fg=ORANGE)
             if msim.tool_change_left <= 0:
+                # Countdown done — now physically install the replacement
+                agent = next(
+                    (a for a in self.fa.agents if a.machine_id == mid), None)
+                for tool_id in msim.worn_tool_ids:
+                    if agent is None:
+                        break
+                    worn_rec = agent.tool_crib.get(tool_id)
+                    if worn_rec is None:
+                        continue
+                    cmd = self.fa.install_replacement_tool(
+                        agent, worn_rec, cur_tick,
+                        urgency=msim.tool_change_reason)
+                    if cmd is None:
+                        continue
+                    p   = cmd.payload
+                    if cmd.action == "tool_out_of_stock":
+                        self._fpanel.log(
+                            f"⚠ {mid} {tool_id} — NO stock "
+                            f"[{msim.tool_change_reason}] machine will stall",
+                            "warn")
+                    else:
+                        sub = (f" (SUBSTITUTE Ø{p['diameter_mm']:.0f}mm)"
+                               if p.get("substitute") else "")
+                        self._fpanel.log(
+                            f"🔧 {mid} {tool_id} → {p['new_tool_id']}{sub}  "
+                            f"[{msim.tool_change_reason}]", "ok")
+                        if p.get("needs_replanning"):
+                            self._trigger_replan(mid)
+                msim.worn_tool_ids = []
                 msim.status = "idle"
                 if panel:
                     panel.set_idle_label()
                 self._fpanel.log(
                     f"✅ {mid} tool change complete "
-                    f"({msim.tool_change_reason})", "ok")
+                    f"[{msim.tool_change_reason}]", "ok")
 
         elif msim.status == "setup":
             msim.setup_left -= 1
@@ -2252,8 +2292,17 @@ class FactoryGUI(tk.Tk):
             self._fpanel.update_kpis(kpis, tick)
             self._tick_lbl.configure(text=f"tick {tick}")
             for cmd in ev.data.get("cmds", []):
-                _tool_actions = ("replace_tool", "tool_out_of_stock")
-                if cmd["action"] == "tool_out_of_stock":
+                if cmd["action"] in ("tool_worn_stop", "tool_worn_warn"):
+                    # Detection-only signal from _manage_tool_cribs
+                    # — actual swap happens at end of tool_change countdown
+                    urgency = "stop" if cmd["action"] == "tool_worn_stop" else "warn"
+                    p       = cmd.get("payload", {})
+                    tag     = "warn" if urgency == "stop" else "ok"
+                    self._fpanel.log(
+                        f"🔴 {cmd['mid']} {p.get('tool_id','?')} "
+                        f"life={p.get('life_pct',0):.1f}% "
+                        f"[≥ {urgency.upper()} threshold]", tag)
+                elif cmd["action"] == "tool_out_of_stock":
                     tag = "warn"
                     self._fpanel.log(
                         f"⚠ {cmd['mid']} — tool out of stock: "

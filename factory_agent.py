@@ -417,33 +417,36 @@ class FactoryAgent:
 
     def _manage_tool_cribs(self, tick_num: int) -> list[FactoryCommand]:
         """
-        WARN_PCT: schedule replacement at next part-load boundary.
-          - Queued in _tools_pending_change; the GUI _tick_machine checks
-            this set when transitioning idle → setup and inserts a
-            tool_change phase first.
-        STOP_PCT: block new job start immediately.
-          - Handled the same way; the idle→setup guard sees needs_replacement
-            and refuses to start until the tool_change countdown finishes.
-        In both cases the actual swap + downtime countdown is driven by
-        the GUI state machine, not here.
+        Detect worn tools and emit FactoryCommands for logging/UI only.
+        NO tool is installed here — the actual swap is deferred to the
+        GUI _tick_machine tool_change countdown so that downtime is
+        correctly accounted for.  install_replacement_tool() does the swap.
         """
         commands = []
         for agent in self.agents:
-            # STOP_PCT tools: flag immediately via FactoryCommand
             for worn in agent.tool_crib.tools_at_stop():
-                cmd = self._send_tool_replacement(agent, worn, tick_num,
-                                                  urgency="stop")
-                if cmd is not None:
-                    commands.append(cmd)
-            # WARN_PCT tools: schedule for next changeover
+                commands.append(FactoryCommand(
+                    command_id        = str(uuid.uuid4()),
+                    target_machine_id = agent.machine_id,
+                    action            = "tool_worn_stop",
+                    payload           = {"tool_id": worn.tool_id,
+                                         "life_pct": worn.remaining_life_pct},
+                    priority          = "critical",
+                    tick_issued       = tick_num,
+                ))
             for worn in agent.tool_crib.tools_at_warn():
-                cmd = self._send_tool_replacement(agent, worn, tick_num,
-                                                  urgency="warn")
-                if cmd is not None:
-                    commands.append(cmd)
+                commands.append(FactoryCommand(
+                    command_id        = str(uuid.uuid4()),
+                    target_machine_id = agent.machine_id,
+                    action            = "tool_worn_warn",
+                    payload           = {"tool_id": worn.tool_id,
+                                         "life_pct": worn.remaining_life_pct},
+                    priority          = "normal",
+                    tick_issued       = tick_num,
+                ))
         return commands
 
-    def _send_tool_replacement(
+    def install_replacement_tool(
         self,
         agent:      CncAgent,
         worn:       ToolRecord,
@@ -451,20 +454,13 @@ class FactoryAgent:
         urgency:    str = "warn",   # "warn" | "stop"
     ) -> Optional[FactoryCommand]:
         """
-        Install a replacement tool in the agent's crib.
+        Pop a replacement from inventory and physically install it in the
+        agent's crib.  Called by the GUI at the END of the tool_change
+        countdown so that downtime is real.  Never called from _manage_tool_cribs.
 
-        1. Try exact tool_id match from inventory.
-        2. If stock empty, find nearest-diameter tool across ALL inventory
-           entries and use that instead.  Log the substitution.
-        3. If truly nothing available, log a critical warning and return None.
-
-        The FactoryCommand payload includes:
-          tool_id        : id of the worn tool being replaced
-          new_tool_id    : id of the fresh tool installed
-          diameter_mm    : diameter of the fresh tool
-          substitute     : True when a different-diameter tool was used
-          urgency        : "warn" | "stop"
-          needs_replanning : True when substitute=True (caller must re-CAM)
+        1. Exact tool_id match from inventory.
+        2. Nearest-diameter substitute if exact stock is empty.
+        3. tool_out_of_stock FactoryCommand if nothing at all available.
         """
         stock = self.tool_inventory.get(worn.tool_id, [])
         substitute = False

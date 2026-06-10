@@ -241,6 +241,14 @@ MAX_REMINDERS: int = 4
 TOOL_CHANGE_TIME_S:  float = 150.0   # seconds to swap a tool (2.5 min)
 # WARN_PCT: replace at next part-load boundary (half the change time)
 # STOP_PCT: block new job start; finish current op then change tool
+
+# ── Tool-wear acceleration (testing only) ───────────────────────────────────
+# Each completed job deducts  (mach_s × TOOL_LIFE_DEPLETION_MULT)  from the
+# tool’s remaining life instead of mach_s alone.  At 1.0 a 30-hr tool lasts
+# ~115 jobs; at 20.0 it hits WARN_PCT after ~6 jobs — visible in the first
+# minute of a sim run.
+# Set back to 1.0 for realistic production behaviour.
+TOOL_LIFE_DEPLETION_MULT: float = 20.0   # 1.0 = real-time; >1 = accelerated wear
 PART_SETUP_TIME_S:   float = 120.0   # seconds to clamp and fixture a part  (2 min)
 PART_REMOVAL_TIME_S: float = 120.0   # seconds to unclamp and remove a part (2 min)
 PART_BUFFER_TIME_S:  float =  60.0   # contingency per cycle
