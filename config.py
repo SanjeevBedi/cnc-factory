@@ -289,7 +289,11 @@ FACTORY_TOOL_STOCK_PER_SPEC: int = 3
 # environment variable, then to an empty string (LLM disabled).
 #
 # To set your key:  open factory_secrets.ini and replace sk-your-key-here
-OPENAI_API_KEY: str = (
-    _secrets.get("OPENAI_API_KEY")
-    or os.environ.get("OPENAI_API_KEY", "")
-)
+#
+# ── TEMPORARILY DISABLED — forces rule-based fallback ───────────────────────
+# To re-enable: comment out the override line and uncomment the block below.
+OPENAI_API_KEY: str = ""   # DISABLED
+# OPENAI_API_KEY: str = (
+#     _secrets.get("OPENAI_API_KEY")
+#     or os.environ.get("OPENAI_API_KEY", "")
+# )
