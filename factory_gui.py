@@ -144,6 +144,30 @@ class GuiEvent:
     data:  dict  = field(default_factory=dict)
 
 
+@dataclass
+class _MachSim:
+    """
+    Self-contained per-machine simulation state.
+
+    Lifecycle:  idle ► setup ► machining ► unclamp ► idle
+
+    The central Scheduler handles KPIs, error handling, and tool-crib
+    audits only.  Job routing goes directly from the factory spawner
+    into each machine's own queue; no scheduler machine assignment.
+    """
+    mid:          str
+    enabled:      bool   = True     # False → spawner skips this machine
+    status:       str    = "idle"   # idle | setup | machining | unclamp
+    current_job:  object = None
+    queue:        deque  = field(default_factory=deque)
+    setup_left:   int    = 0
+    unclamp_left: int    = 0
+    gcode_lines:    list  = field(default_factory=list)
+    gcode_cursor:   int   = 0
+    mach_start_tick: int  = 0      # sim tick when machining phase began
+    n_lines_done:   int   = 0      # captured at machining-complete
+
+
 # ── 2-D G-code canvas ─────────────────────────────────────────────────────────
 
 class GCodeCanvas(tk.Canvas):
@@ -500,6 +524,15 @@ class MachinePanel(ttk.Frame):
         )
         self._sim_btn.pack(side="right", padx=4)
 
+        # Enable / disable toggle (● = accepting jobs, ○ = paused)
+        self._enable_btn = tk.Button(
+            hdr, text="●", fg=GREEN, bg=accent,
+            relief="flat", font=("Helvetica", 12),
+            activebackground=accent,
+            command=self._toggle_machine,
+        )
+        self._enable_btn.pack(side="right", padx=2)
+
         # ── tool line ─────────────────────────────────────────────────────
         tl = tk.Frame(self, bg=PNL)
         tl.pack(fill="x", padx=2, pady=1)
@@ -575,6 +608,10 @@ class MachinePanel(ttk.Frame):
     def set_unclamp_label(self, seed, steps_left: int) -> None:
         self._part_lbl.configure(
             text=f"⏳ Unloading {seed}  ({steps_left} steps)", fg=ORANGE)
+
+    def set_setup_label(self, seed, steps_left: int) -> None:
+        self._part_lbl.configure(
+            text=f"🔧 Setup {seed}  ({steps_left} steps)", fg=ACCENT)
 
     def update_state(self, state: dict) -> None:
         status = state.get("status", "idle")
@@ -659,6 +696,20 @@ class MachinePanel(ttk.Frame):
             self._chat = AgentConversationWindow(self._app, self._mid, self._app)
         else:
             self._chat.open()
+
+    def _toggle_machine(self) -> None:
+        """Toggle between enabled (accepts new jobs) and disabled (drains only)."""
+        msim = self._app._msim.get(self._mid)
+        if msim is None:
+            return
+        msim.enabled = not msim.enabled
+        if msim.enabled:
+            self._enable_btn.configure(text="●", fg=GREEN)
+            self._app._fpanel.log(f"{self._mid} enabled — accepting new jobs", "ok")
+        else:
+            self._enable_btn.configure(text="○", fg=DIM)
+            self._app._fpanel.log(
+                f"{self._mid} disabled — finishes current job, no new intake", "warn")
 
     def _launch_sim(self) -> None:
         port = SIM_PORTS[self._mid]
@@ -868,52 +919,43 @@ class FactoryGUI(tk.Tk):
         self._openai_key  = openai_key
         self._demo_break  = demo_break   # (machine_id, tick)
         self._running     = False
-        # ── Base time loop ─────────────────────────────────────────────
-        # No fixed DT -- each G-code line sleeps dt_sim / compression / speed.
-        # Three counters driven by the same base tick (SIM_TICK_S = 1 sim-s).
-        self._speed:          float = 1.0
-        self._sim_step_count: int   = 0
-        self._gui_acc:        float = 0.0   # simulated-s since last GUI refresh
-        self._seed_acc:       float = 0.0   # simulated-s since last seed offer
-        self._eq: queue.Queue[GuiEvent]  = queue.Queue()
-        self._gcode_cursors: dict[str, int]        = {}
-        self._gcode_lines:   dict[str, list[str]]  = {}
-        self._gcode_job_id:  dict[str, str]        = {}   # mid → job_id driving canvas
-        self._chat_wins:     dict[str, AgentConversationWindow] = {}
-        self._pipeline_wins: dict[int, PipelineMonitorWindow]   = {}  # seed → window
+        # ── Timing model ────────────────────────────────────────────────────
+        # All timing driven by config.T_TICK_S (default 5 s).
+        # GUI refresh every config.T_G_MULT ticks = config.T_G_S sim-seconds.
+        # Seed probability computed by timing_model at startup.
+        self._speed    = 1.0
+        self._sim_step_count = 0
+        self._gui_tick_count = 0     # ticks since last GUI refresh
+        self._t_avg_mach_s = config.T_AVG_MACH_S
+        self._p_seed         = 0.0   # float — per-tick probability (set at startup)
+        # Seeded RNG — used for ALL random decisions so runs are reproducible.
+        # Seeded from config.SIM_RNG_SEED; set that to None for random runs.
+        self._rng            = random.Random(config.SIM_RNG_SEED)
+        self._eq       = queue.Queue()
+        self._chat_wins = {}
+        self._pipeline_wins = {}  # seed → window
 
-        # Animation queues — one deque per machine; GUI pops to animate
-        self._anim_queues: dict[str, deque] = {}
-        self._anim_seen:   set[str]         = set()  # job_ids already queued
+        # Per-machine independent simulation states
+        self._msim = {}           # mid → _MachSim
+        self._cam_in_flight = 0   # CAM threads currently running
 
-        # Unclamp (part-removal) phase — tracks countdown per machine
-        # dict: mid → {"job": job, "steps": int}
-        self._unclamp: dict[str, Optional[dict]] = {}
-        # Steps for visual unclamp phase (proportional to PART_REMOVAL_TIME_S)
-        # Unclamp and setup durations in sim-steps.
-        # Each step represents T_avg/L_avg seconds of machining time,
-        # so these express the physical durations relative to the job length.
-        # UNCLAMP = PART_REMOVAL_TIME_S / (T_avg/L_avg)
-        #         = PART_REMOVAL_TIME_S * L_avg / T_avg
-        # Use a fixed ratio: removal is ~1.5% of machining time  (5/340)
-        # T_UNIT_SECONDS = 1 s, so steps == simulated seconds directly.
-        self._UNCLAMP_STEPS: int = round(config.PART_REMOVAL_TIME_S)   # 60 steps
-        self._SETUP_STEPS:   int = round(config.PART_SETUP_TIME_S)     # 60 steps
-
+        # Part timing constants (simulated seconds)
+        self._UNCLAMP_S = config.PART_REMOVAL_TIME_S   # 120 s
+        self._SETUP_S   = config.PART_SETUP_TIME_S     # 120 s
         # Indexed solid library — built once on first Load Seeds press.
         # Index i → seed value.  Random index selection allows repeats.
-        self._seed_index: list[int] = []   # [seed0, seed1, …, seedN]
-        self._seed_max_idx: int     = -1   # len(_seed_index) - 1
+        self._seed_index = []   # [seed0, seed1, …, seedN]
+        self._seed_max_idx = -1   # len(_seed_index) - 1
 
 
         # Completed parts log
-        self._completed_parts: list[dict] = []
+        self._completed_parts = []
 
         # Parts queue display window (single window, opened on demand)
-        self._queue_win: Optional["PartsQueueWindow"] = None
+        self._queue_win = None
 
         # Track all seeds ever submitted this session (for queue window)
-        self._all_jobs: list[dict] = []   # {seed, mid, status, lines, job_id}
+        self._all_jobs = []   # {seed, mid, status, lines, job_id}
 
         # build ttk styles
         self._build_styles()
@@ -924,11 +966,7 @@ class FactoryGUI(tk.Tk):
             openai_api_key=openai_key, dry_run=True,
         )
         for ag in self.fa.agents:
-            self._gcode_cursors[ag.machine_id] = 0
-            self._gcode_lines[ag.machine_id]   = []
-            self._gcode_job_id[ag.machine_id]  = ""
-            self._anim_queues[ag.machine_id]   = deque()
-            self._unclamp[ag.machine_id]       = None
+            self._msim[ag.machine_id] = _MachSim(mid=ag.machine_id)
 
         # build layout
         self._build_layout()
@@ -1126,7 +1164,19 @@ class FactoryGUI(tk.Tk):
 
     def _load_seeds_thread(self, seeds: list[int]) -> None:
         """
-        Background thread: run the full CAM pipeline for each seed.
+        Background thread: run the full CAM pipeline for each seed, then
+        add the CAM-ready job to the scheduler queue.
+
+        Two-phase approach
+        ------------------
+        Phase 1 (CAM)  — build_job_from_seed():
+            solid → features → feeds/speeds → toolpath → G-code
+            The part is fully programmed before it touches the queue.
+        Phase 2 (queue) — enqueue_job():
+            Only after G-code is validated does the job enter the
+            scheduler.  The machine queue therefore always receives
+            finished, ready-to-run programs.
+
         Pipeline windows are NOT auto-opened — user opens via 📋 Queue button.
         Progress callbacks are delivered to whichever PipelineMonitorWindow
         already exists for that seed (if the user manually opened one).
@@ -1137,20 +1187,40 @@ class FactoryGUI(tk.Tk):
             progress_cb = (win.progress
                            if win and win.winfo_exists() else None)
 
-            # Run pipeline — this submits the job to the scheduler
-            job = self.fa.submit_new_seed(seed, progress_cb=progress_cb)
+            # ── Phase 1: run CAM pipeline (solid → G-code) ────────────────
+            # The job is NOT in the queue yet at this point.
+            job = self.fa.build_job_from_seed(
+                seed,
+                progress_cb=progress_cb,
+            )
 
-            if job:
-                entry = {
-                    "seed":    seed,
-                    "job_id":  job.job_id,
-                    "lines":   len(job.gcode_lines),
-                    "status":  "queued",
-                    "machine": "—",
-                }
-                self._all_jobs.append(entry)
-                self._eq.put(GuiEvent("job_registered", "factory",
-                                       {"entry": entry}))
+            if job is None:
+                self._fpanel.log(
+                    f"⚠ CAM pipeline returned None for seed {seed}", "warn")
+                continue
+
+            dest = self._route_job(job)
+            if dest is None:
+                self._fpanel.log(
+                    f"⚠ Seed {seed}: no enabled machines — discarded.", "warn")
+                continue
+
+            self._fpanel.log(
+                f"📄 Seed {seed}  G-code ready  "
+                f"({len(job.gcode_lines)} lines)  →  {dest}",
+                "ok",
+            )
+
+            entry = {
+                "seed":    seed,
+                "job_id":  job.job_id,
+                "lines":   len(job.gcode_lines),
+                "status":  "queued",
+                "machine": dest,
+            }
+            self._all_jobs.append(entry)
+            self._eq.put(GuiEvent("job_registered", "factory",
+                                   {"entry": entry}))
 
         # auto-start the sim after seeds are loaded
         self._eq.put(GuiEvent("autostart", "factory", {}))
@@ -1160,6 +1230,17 @@ class FactoryGUI(tk.Tk):
             return
         self._running = True
         self._status_bar.configure(text="Simulation running…")
+        # Bootstrap timing model if not yet done
+        if self._p_seed == 0.0:
+            import timing_model as _tm
+            self._p_seed = _tm.seed_probability(self._t_avg_mach_s)
+            cap          = _tm.shift_capacity(self._t_avg_mach_s)
+            self._fpanel.log(
+                f"Timing model: T_tick={config.T_TICK_S}s  "
+                f"T_avg={self._t_avg_mach_s/60:.1f} min  "
+                f"idle={config.SIM_IDLE_PCT:.0f}%  "
+                f"target={cap['target_parts']} parts/shift  "
+                f"P={self._p_seed:.5f}", "ok")
         t = threading.Thread(target=self._sim_loop, daemon=True)
         t.start()
 
@@ -1174,11 +1255,8 @@ class FactoryGUI(tk.Tk):
             openai_api_key=self._openai_key, dry_run=True,
         )
         for ag in self.fa.agents:
-            self._gcode_cursors[ag.machine_id] = 0
-            self._gcode_lines[ag.machine_id]   = []
-            self._gcode_job_id[ag.machine_id]  = ""
-            self._anim_queues[ag.machine_id]   = deque()
-            self._unclamp[ag.machine_id]       = None
+            self._msim[ag.machine_id] = _MachSim(mid=ag.machine_id)
+        self._cam_in_flight = 0
         self._initial_populate()
         self._status_bar.configure(text="Stopped — factory reset")
         self._fpanel.log("Factory reset", "warn")
@@ -1199,27 +1277,27 @@ class FactoryGUI(tk.Tk):
           - Advances SIM_TICK_S (= 1) simulated seconds.
           - Sleeps SIM_TICK_S / (SIM_COMPRESSION x speed) wall-seconds.
           - GUI counter   : accumulates sim-s; refresh every SIM_GUI_INTERVAL_S.
-          - Seed counter  : accumulates sim-s; offer seed every SIM_SEED_INTERVAL_S.
           - Scheduler tick: fa.tick() called once (T_UNIT_SECONDS = 1).
+
+        NOTE: _auto_seed_tick() is called ONLY here, exactly once per tick.
+        It must NOT also be called inside _do_sim_step() — doing so fires
+        two Bernoulli trials per tick and doubles the seed arrival rate.
         """
         import time as _time
-        wall_sleep_base = config.SIM_TICK_S / config.SIM_COMPRESSION
+        wall_sleep_base = config.T_TICK_S / config.SIM_COMPRESSION
 
         while self._running:
             self._do_sim_step()
             self._sim_step_count += 1
 
-            # GUI counter
-            self._gui_acc += config.SIM_TICK_S
-            if self._gui_acc >= config.SIM_GUI_INTERVAL_S:
+            # GUI counter: refresh every T_G_MULT ticks
+            self._gui_tick_count += 1
+            if self._gui_tick_count >= config.T_G_MULT:
                 self._post_gui_events()
-                self._gui_acc = 0.0
+                self._gui_tick_count = 0
 
-            # Seed counter
-            self._seed_acc += config.SIM_TICK_S
-            if self._seed_acc >= config.SIM_SEED_INTERVAL_S:
-                self._auto_seed_tick()
-                self._seed_acc = 0.0
+            # Seed arrival: ONE Bernoulli trial per tick (seeded RNG)
+            self._auto_seed_tick()
 
             _time.sleep(wall_sleep_base / self._speed)
 
@@ -1253,146 +1331,31 @@ class FactoryGUI(tk.Tk):
         result = self.fa.tick()
         cur_tick = self.fa.scheduler.tick
 
-        # ── 2. Capture jobs from this tick, then catch-up if scheduler is ahead ──
-        # _capture_jobs is called after EACH tick so anim_queue depth is
-        # accurate before the next catch-up check.  This prevents the old
-        # bug where 8 ticks ran without updating depth, flooding each machine
-        # with up to 8 queued jobs and triggering the overflow pause.
-        # Overhead to add to remaining_s when a job is first assigned.
-        # The scheduler only sets remaining_s = estimated_time_s (machining).
-        # Adding setup + removal + buffer makes the scheduler cycle at the
-        # full CYCLE_S rate, keeping it in sync with the seed interval.
-        _cycle_overhead = (config.PART_SETUP_TIME_S
-                           + config.PART_REMOVAL_TIME_S
-                           + config.PART_BUFFER_TIME_S)
+        # ── 2. Advance each machine independently ───────────────────────────────────
+        for msim in self._msim.values():
+            self._tick_machine(msim, cur_tick)
 
-        def _capture_jobs(tick_id: int) -> None:
-            for sm in self.fa.scheduler.machines:
-                mid = sm.machine_id
-                if sm.current_job and sm.current_job.job_id not in self._anim_seen:
-                    self._anim_seen.add(sm.current_job.job_id)
-                    self._anim_queues[mid].append(sm.current_job)
-                    # Stretch remaining_s to full cycle so scheduler doesn't
-                    # complete the job until clamp + unclamp + buffer have passed.
-                    sm.remaining_s += _cycle_overhead
-            # Jobs that completed THIS tick (est_time_s < T_UNIT means a job
-            # starts in tick N and finishes in tick N+1; checking started_at_tick
-            # always misses them because started!=finished.  Use finished_at_tick.
-            for job in self.fa.scheduler.completed_jobs:
-                if (job.finished_at_tick == tick_id
-                        and job.assigned_machine_id
-                        and job.job_id not in self._anim_seen):
-                    self._anim_seen.add(job.job_id)
-                    self._anim_queues[job.assigned_machine_id].append(job)
-
-        _capture_jobs(cur_tick)
-
-        # Catch-up: if the scheduler freed a machine (via Fix-A remaining_s=-1)
-        # and has jobs queued, run one extra tick so the assignment happens this
-        # step rather than the next.  Cap at 1 extra tick per step -- enough to
-        # handle the fix-A unclamp case without ever assigning more than 1 new
-        # job per machine per step.
-        _MAX_CATCH_UP = 1
-        for _ in range(_MAX_CATCH_UP):
-            needs = [
-                sm for sm in self.fa.scheduler.machines
-                if sm.is_idle() and self.fa.scheduler.job_queue
-            ]
-            if not needs:
-                break
-            self.fa.tick()
-            cur_tick = self.fa.scheduler.tick
-            _capture_jobs(cur_tick)
-
-        # ── 3-6. Advance animation per machine ─────────────────────────────
-        for ag in self.fa.agents:
-            mid   = ag.machine_id
-            lines = self._gcode_lines.get(mid, [])
-            cur   = self._gcode_cursors.get(mid, 0)
-            q     = self._anim_queues[mid]
-            panel = self._panels.get(mid)
-
-            # ── 5b. Unclamp countdown (runs INSTEAD of normal anim when active) ──
-            if self._unclamp[mid] is not None:
-                info = self._unclamp[mid]
-                info["steps"] -= 1
-                if panel:
-                    panel.set_unclamp_label(info["job"].seed, info["steps"])
-                if info["steps"] <= 0:
-                    # Unclamp done — record completion and clear
-                    self._record_completed_job(
-                        mid, info["job"], info["n_lines"], cur_tick)
-                    self._unclamp[mid] = None
-                    self._gcode_lines[mid]   = []
-                    self._gcode_cursors[mid] = 0
-                    self._gcode_job_id[mid]  = ""
-                    if panel:
-                        panel.set_idle_label()
-                    self._eq.put(GuiEvent("gcode_clear", mid, {}))
-                    # Fix A: force the scheduler machine idle NOW so
-                    # _assign_jobs can pick up the next queued job
-                    # on the very next fa.tick() call.
-                    for sm in self.fa.scheduler.machines:
-                        if (sm.machine_id == mid
-                                and sm.current_job is not None
-                                and sm.current_job.job_id == info["job"].job_id):
-                            sm.remaining_s = -1.0   # triggers _complete_job next tick
-                            break
-                continue   # don’t advance animation during unclamp
-
-            # 3. Start animating next queued job if canvas is empty
-            if not lines and q:
-                next_job = q[0]   # peek — don’t pop yet
-                self._gcode_job_id[mid]  = next_job.job_id
-                self._gcode_lines[mid]   = next_job.gcode_lines
-                self._gcode_cursors[mid] = 0
-                lines = next_job.gcode_lines
-                cur   = 0
-                if panel:
-                    panel.set_machining_label(next_job.seed, "▶")
-                self._eq.put(GuiEvent("gcode_step", mid,
-                                      {"lines": lines, "cursor": 0}))
-
-            # 4. Advance cursor one line
-            if lines and cur < len(lines):
-                self._gcode_cursors[mid] = cur + 1
-                self._eq.put(GuiEvent("gcode_step", mid,
-                                      {"lines": lines, "cursor": cur + 1}))
-
-            # 5a. Animation complete — enter unclamp phase
-            elif lines and cur >= len(lines):
-                done_job = q.popleft() if q else None
-                if done_job:
-                    # Start unclamp countdown instead of immediately completing
-                    self._unclamp[mid] = {
-                        "job":    done_job,
-                        "steps":  self._UNCLAMP_STEPS,
-                        "n_lines": len(lines),
-                    }
-                    if panel:
-                        panel.set_unclamp_label(done_job.seed, self._UNCLAMP_STEPS)
-                else:
-                    # Nothing in queue, just clear
-                    self._gcode_lines[mid]   = []
-                    self._gcode_cursors[mid] = 0
-                    self._gcode_job_id[mid]  = ""
-                    if panel:
-                        panel.set_idle_label()
-                    self._eq.put(GuiEvent("gcode_clear", mid, {}))
-
-        # ── 7. Queue overflow guard — pause if any machine queue > 10 ───────
-        max_q = max((len(q) for q in self._anim_queues.values()), default=0)
-        if max_q > 10 and self._running:
+        # ── 3. Queue overflow guard ───────────────────────────────────────────────────
+        # Safety net: same per-machine cap as back-pressure above.
+        # Should only fire if back-pressure fails (e.g. machine disabled
+        # after jobs were already routed to it).
+        n_enabled = max(1, sum(1 for m in self._msim.values() if m.enabled))
+        _cap      = n_enabled * config.SIM_MAX_AHEAD_PER_MACHINE
+        total_q   = (sum(len(m.queue) for m in self._msim.values())
+                     + self._cam_in_flight)
+        if total_q > _cap and self._running:
             self.pause_sim()
             self._fpanel.log(
-                f"⚠ Queue overflow ({max_q} parts). Simulation paused.", "warn")
+                f"⚠ Queue overflow  machine_queues={total_q - self._cam_in_flight}  "
+                f"in_flight={self._cam_in_flight}  "
+                f"total={total_q} > cap({n_enabled}×{config.SIM_MAX_AHEAD_PER_MACHINE}={_cap}).  "
+                "Simulation paused.", "warn")
             return
 
-        # ── 8. Auto-seed generation ────────────────────────────────────────
-        self._auto_seed_tick()
-
-        # ── 9. Stash tick/result for GUI flush ────────────────────────────
+        # ── 8. Stash tick/result for GUI flush ─────────────────────────────────
         # _post_gui_events() is called by _sim_loop on a wall-clock timer.
+        # NOTE: _auto_seed_tick() is NOT called here — it is called exactly
+        # once per tick by _sim_loop, after _do_sim_step() returns.
         self._last_tick   = cur_tick
         self._last_result = result
 
@@ -1419,8 +1382,8 @@ class FactoryGUI(tk.Tk):
         self, mid: str, job, n_lines: int, tick_done: int
     ) -> None:
         """Record a finished job and post it to the completed-parts panel."""
-        load_s   = config.PART_SETUP_TIME_S
-        unload_s = config.PART_REMOVAL_TIME_S
+        load_s   = self._SETUP_S
+        unload_s = self._UNCLAMP_S
         mach_s   = round(job.estimated_time_s, 1)
         total_s  = round(load_s + mach_s + unload_s, 1)
         stats = {
@@ -1434,6 +1397,7 @@ class FactoryGUI(tk.Tk):
             "tick_done":   tick_done,
         }
         self._completed_parts.append(stats)
+        self.fa.total_jobs_completed += 1   # scheduler bypassed; track manually
         # Update status in _all_jobs tracking list
         for entry in self._all_jobs:
             if entry.get("job_id") == job.job_id:
@@ -1451,19 +1415,149 @@ class FactoryGUI(tk.Tk):
 
     # ── Auto-seed generation ─────────────────────────────────────────────────
 
+    def _route_job(self, job) -> "Optional[str]":
+        """
+        Route a new job to the enabled machine with the shortest queue.
+        Returns the machine_id it was sent to, or None if all disabled.
+        """
+        eligible = [(mid, m) for mid, m in self._msim.items() if m.enabled]
+        if not eligible:
+            return None
+        mid, msim = min(eligible, key=lambda x: len(x[1].queue))
+        msim.queue.append(job)
+        return mid
+
+    def _tick_machine(self, msim: "_MachSim", cur_tick: int) -> None:
+        """
+        Advance one machine through its lifecycle by one tick.
+
+            idle      — if queue non-empty, pop next job → setup
+            setup     — countdown setup ticks → machining
+            machining — at each tick compute elapsed_s = (cur_tick - mach_start_tick) × T_TICK_S;
+                          call waypoints_due(elapsed_s) to tag all waypoints whose
+                          t_end has passed; map done-fraction → G-code cursor;
+                          transition to unclamp when elapsed_s ≥ estimated_time_s
+            unclamp   — countdown unclamp ticks → idle + record completion
+        """
+        mid   = msim.mid
+        panel = self._panels.get(mid)
+
+        if msim.status == "idle":
+            if msim.queue:
+                msim.current_job  = msim.queue.popleft()
+                msim.gcode_lines  = msim.current_job.gcode_lines
+                msim.gcode_cursor = 0
+                msim.setup_left   = max(1, round(self._SETUP_S / config.T_TICK_S))
+                msim.status       = "setup"
+                if panel:
+                    panel.set_setup_label(msim.current_job.seed, msim.setup_left)
+
+        elif msim.status == "setup":
+            msim.setup_left -= 1
+            if panel:
+                panel.set_setup_label(msim.current_job.seed, msim.setup_left)
+            if msim.setup_left <= 0:
+                msim.status          = "machining"
+                msim.mach_start_tick = cur_tick   # record when cutting begins
+                if panel:
+                    panel.set_machining_label(msim.current_job.seed, "▶")
+                self._eq.put(GuiEvent("gcode_step", mid,
+                                      {"lines": msim.gcode_lines, "cursor": 0}))
+
+        elif msim.status == "machining":
+            lines     = msim.gcode_lines
+            job       = msim.current_job
+            elapsed_s = (cur_tick - msim.mach_start_tick) * config.T_TICK_S
+
+            if job.toolpath_result is not None:
+                # ── Time-driven: tag waypoints whose t_end ≤ elapsed_s,
+                #    then map the done-fraction onto the G-code line index.
+                import timing_model as _tm
+                all_passes = [
+                    p
+                    for face in job.toolpath_result.faces
+                    for p in face.passes
+                ]
+                _tm.waypoints_due(all_passes, elapsed_s)   # sets wp._done in-place
+                n_done, n_total = _tm.count_done(all_passes)
+                new_cursor = (
+                    min(len(lines), round(n_done / n_total * len(lines)))
+                    if n_total > 0 else len(lines)
+                )
+                if new_cursor != msim.gcode_cursor:
+                    msim.gcode_cursor = new_cursor
+                    self._eq.put(GuiEvent("gcode_step", mid,
+                                          {"lines": lines, "cursor": new_cursor}))
+                job_done = elapsed_s >= job.estimated_time_s
+            else:
+                # Fallback (no toolpath result): advance one line per tick
+                if msim.gcode_cursor < len(lines):
+                    msim.gcode_cursor += 1
+                    self._eq.put(GuiEvent("gcode_step", mid,
+                                          {"lines": lines, "cursor": msim.gcode_cursor}))
+                job_done = msim.gcode_cursor >= len(lines)
+
+            if job_done:
+                # Machining complete → enter unclamp phase
+                msim.n_lines_done = len(lines)
+                msim.gcode_lines  = []
+                msim.gcode_cursor = 0
+                msim.unclamp_left = max(1, round(self._UNCLAMP_S / config.T_TICK_S))
+                msim.status       = "unclamp"
+                self._eq.put(GuiEvent("gcode_clear", mid, {}))
+                if panel:
+                    panel.set_unclamp_label(job.seed, msim.unclamp_left)
+
+        elif msim.status == "unclamp":
+            msim.unclamp_left -= 1
+            if panel:
+                panel.set_unclamp_label(msim.current_job.seed, msim.unclamp_left)
+            if msim.unclamp_left <= 0:
+                self._record_completed_job(
+                    mid, msim.current_job, msim.n_lines_done, cur_tick)
+                msim.current_job  = None
+                msim.n_lines_done = 0
+                msim.status       = "idle"
+                if panel:
+                    panel.set_idle_label()
+
     def _auto_seed_tick(self) -> None:
         """
-        Called every SIM_SEED_INTERVAL_S simulated seconds by _sim_loop.
-        Offers one seed to the scheduler if the queue is not already full.
-        Rate: SHIFT_S / SIM_SEED_INTERVAL_S = 355 seeds per shift.
+        Called ONCE per tick from _sim_loop (never from _do_sim_step).
+        Offers one seed to the CAM pipeline + queue with probability
+        self._p_seed (computed from timing_model.seed_probability at startup).
+
+        Back-pressure: skips if the COMBINED queue depth
+        (scheduler.job_queue + all per-machine animation queues) is already
+        >= n_enabled * SIM_MAX_AHEAD_PER_MACHINE.  This matches the overflow guard in _do_sim_step
+        so both guards see the same picture.
+
+        Uses self._rng (seeded in __init__ from config.SIM_RNG_SEED) so the
+        seed-arrival sequence is identical across runs when SIM_RNG_SEED is set.
         """
         if not self._seed_index:
             return
-        if len(self.fa.scheduler.job_queue) >= config.SIM_MAX_QUEUE_AHEAD:
+
+        # Back-pressure: stop spawning when the combined queue depth
+        # (waiting jobs on all machines + in-flight CAM threads) reaches
+        # SIM_MAX_AHEAD_PER_MACHINE jobs per currently-enabled machine.
+        n_enabled = max(1, sum(1 for m in self._msim.values() if m.enabled))
+        _cap      = n_enabled * config.SIM_MAX_AHEAD_PER_MACHINE
+        total_q   = (sum(len(m.queue) for m in self._msim.values())
+                     + self._cam_in_flight)
+        if total_q >= _cap:
             return
-        idx  = random.randint(0, self._seed_max_idx)
+
+        # One Bernoulli trial per tick using the seeded RNG
+        if self._rng.random() >= self._p_seed:
+            return
+
+        idx  = self._rng.randint(0, self._seed_max_idx)
         seed = self._seed_index[idx]
-        self._fpanel.log(f"\U0001f331 Auto-seed {seed}", "ok")
+        self._fpanel.log(
+            f"\U0001f331 Auto-seed {seed}  "
+            f"(tick={self.fa.scheduler.tick}  "
+            f"q={total_q}  p={self._p_seed:.5f})", "ok")
         threading.Thread(
             target=self._auto_seed_thread,
             args=(seed,),
@@ -1471,28 +1565,60 @@ class FactoryGUI(tk.Tk):
         ).start()
 
     def _auto_seed_thread(self, seed: int) -> None:
-        """Background thread: run CAM pipeline and submit job to scheduler."""
+        """
+        Background thread: run the full CAM pipeline for an auto-generated
+        seed, then — and only then — submit the ready job to the scheduler.
+
+        Two-phase approach (mirrors _load_seeds_thread)
+        ------------------------------------------------
+        Phase 1: build_job_from_seed()  — solid → G-code (no queue touch)
+        Phase 2: enqueue_job()          — validated job enters the queue
+        """
+        self._cam_in_flight += 1
         try:
             win = self._pipeline_wins.get(seed)
             progress_cb = (win.progress
                            if win and win.winfo_exists() else None)
-            job = self.fa.submit_new_seed(seed, progress_cb=progress_cb)
-            if job:
-                entry = {
-                    "seed":    seed,
-                    "job_id":  job.job_id,
-                    "lines":   len(job.gcode_lines),
-                    "status":  "queued",
-                    "machine": "\u2014",
-                }
-                self._all_jobs.append(entry)
-                self._eq.put(GuiEvent("job_registered", "factory",
-                                       {"entry": entry}))
-            else:
+
+            # ── Phase 1: CAM pipeline ──────────────────────────────────────
+            job = self.fa.build_job_from_seed(
+                seed,
+                progress_cb=progress_cb,
+            )
+
+            if job is None:
                 self._fpanel.log(
-                    f"\u26a0 Pipeline returned None for seed {seed}", "warn")
+                    f"⚠ Auto-seed CAM pipeline returned None for seed {seed}",
+                    "warn",
+                )
+                return
+
+            # ── Phase 2: route to least-loaded enabled machine ──────────────
+            dest = self._route_job(job)
+            if dest is None:
+                return
+
+            self._fpanel.log(
+                f"📄 Auto-seed {seed}  G-code ready  "
+                f"({len(job.gcode_lines)} lines)  →  {dest}",
+                "ok",
+            )
+
+            entry = {
+                "seed":    seed,
+                "job_id":  job.job_id,
+                "lines":   len(job.gcode_lines),
+                "status":  "queued",
+                "machine": dest,
+            }
+            self._all_jobs.append(entry)
+            self._eq.put(GuiEvent("job_registered", "factory",
+                                   {"entry": entry}))
+
         except Exception as exc:
-            self._fpanel.log(f"\u274c Auto-seed error: {exc}", "warn")
+            self._fpanel.log(f"❌ Auto-seed error: {exc}", "warn")
+        finally:
+            self._cam_in_flight -= 1
 
     def _open_queue_window(self) -> None:
         """Open (or raise) the single parts-queue display window."""
@@ -2153,23 +2279,15 @@ class PartsQueueWindow(tk.Toplevel):
         if not self.winfo_exists():
             return
 
-        # Gather live machine assignments
+        # Gather live machine assignments from _msim
         live_status: dict[str, str] = {}   # job_id → status
         live_machine: dict[str, str] = {}  # job_id → mid
-        for ag in self._app.fa.agents:
-            mid = ag.machine_id
-            # Currently animating
-            jid = self._app._gcode_job_id.get(mid, "")
-            if jid:
-                live_status[jid]  = "machining"
+        for mid, msim in self._app._msim.items():
+            if msim.current_job:
+                jid = msim.current_job.job_id
+                live_status[jid]  = msim.status
                 live_machine[jid] = mid
-            # In unclamp phase
-            unc = self._app._unclamp.get(mid)
-            if unc and unc.get("job"):
-                live_status[unc["job"].job_id]  = "unloading"
-                live_machine[unc["job"].job_id] = mid
-            # Queued (not yet animating)
-            for job in self._app._anim_queues[mid]:
+            for job in msim.queue:
                 if job.job_id not in live_status:
                     live_status[job.job_id]  = "queued"
                     live_machine[job.job_id] = mid

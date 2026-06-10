@@ -79,6 +79,12 @@ class Waypoint:
     z:         float
     feed_rate: float  # mm/min  (0.0 = rapid G0)
     move_type: str    # 'rapid' | 'linear' | 'helix'
+    # Timing fields — set by timing_model.stamp_waypoints() after planning.
+    # t_start and t_end are decimal simulated seconds from job start.
+    # Both default to 0.0 until stamped; _done tracks execution state.
+    t_start:   float = 0.0
+    t_end:     float = 0.0
+    _done:     bool  = False
 
 
 @dataclass

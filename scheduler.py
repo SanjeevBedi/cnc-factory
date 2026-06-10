@@ -70,6 +70,13 @@ class Job:
     cost_per_s:         float        # machine cost rate ($/s)
     priority:           float = 1.0  # higher = more urgent
     gcode_lines:        list  = field(default_factory=list)  # full program
+    # Stamped toolpath — set by factory_agent.build_job_from_seed() after
+    # timing_model.stamp_toolpath() runs.  Each Waypoint inside carries
+    # t_start / t_end (decimal sim-seconds from job start) and a _done flag.
+    # The GUI tick-executor calls timing_model.waypoints_due() each tick to
+    # find which waypoints have elapsed and advances the G-code cursor to match.
+    # None until the CAM pipeline completes.
+    toolpath_result:    object = None   # ToolpathResult | None
 
     # Runtime fields (set by Scheduler)
     status:             str   = "queued"   # queued | running | done | failed
@@ -210,7 +217,7 @@ class Scheduler:
         Returns a TickResult summarising all events this tick.
         """
         self.tick    += 1
-        self.t_real_s = self.tick * config.T_UNIT_SECONDS
+        self.t_real_s = self.tick * config.T_TICK_S
 
         result = TickResult(tick=self.tick, t_real_s=self.t_real_s)
 
@@ -220,7 +227,7 @@ class Scheduler:
                 continue
 
             # Deplete tool life
-            dt = config.T_UNIT_SECONDS
+            dt = config.T_TICK_S
             m.remaining_s       -= dt
             m.time_accumulated_s += dt
             m.tool_life_fraction  = max(

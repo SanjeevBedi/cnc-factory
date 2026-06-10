@@ -454,15 +454,22 @@ class FactoryAgent:
 
     # ── New job creation ------------------------------------------------------
 
-    def submit_new_seed(
+    def build_job_from_seed(
         self,
         seed: int,
         progress_cb: Optional[Callable] = None,
         generate_if_missing: bool = False,
     ) -> Optional[Job]:
         """
-        Run the full Phase 1-4 pipeline for *seed* and submit the resulting
-        job to the scheduler.
+        Run the full Phase 1–4 CAM pipeline for *seed* and return a
+        **ready-to-queue** Job — WITHOUT submitting it to the scheduler.
+
+        The pipeline progresses through all CAM stages:
+          seed → solid → features → feeds/speeds → toolpath → G-code
+
+        After this call the Job has valid gcode_lines, estimated_time_s,
+        material, and every other field required by the scheduler.  The
+        caller decides when to submit it (by calling enqueue_job).
 
         Parameters
         ----------
@@ -476,7 +483,7 @@ class FactoryAgent:
 
         Returns
         -------
-        Job if successful, None on any error.
+        Job with gcode_lines populated, or None on any error.
         """
 
         def _cb(phase: str, detail: str = "") -> None:
@@ -508,7 +515,7 @@ class FactoryAgent:
                     _cb("error", f"No .npy for seed {seed} — skipping")
                     return None
 
-            _cb("solid", f"Loading faces from disk…")
+            _cb("solid", "Loading faces from disk…")
             faces = bridge.load_face_polygons(seed)
             meta  = bridge.load_metadata(seed)
             vol   = meta.get("volume") or 0.0
@@ -522,16 +529,22 @@ class FactoryAgent:
                 f"{feat.n_top_faces} top faces  |  "
                 f"{getattr(feat, 'n_edges', '?')} edges labelled")
 
-            # ── Stage: feeds & speeds ─────────────────────────────────────
-            _cb("fs", f"Computing feeds/speeds  ({config.DEFAULT_MATERIAL})…")
+            # ── Stage: feeds & speeds (random material assignment) ────────
+            from timing_model import assign_material, stamp_toolpath
+            material = assign_material()
+            _cb("fs", f"Computing feeds/speeds  ({material})…")
             fs = fs_compute(
-                config.DEFAULT_MATERIAL, 12.0, 4,
-                axial_depth_mm=6.0, radial_depth_mm=4.8,
+                material,
+                config.DEFAULT_TOOL_DIAMETER_MM,
+                config.DEFAULT_TOOL_FLUTES,
+                tool_type       = config.DEFAULT_TOOL_TYPE,
+                axial_depth_mm  = 0.50 * config.DEFAULT_TOOL_DIAMETER_MM,
+                radial_depth_mm = 0.40 * config.DEFAULT_TOOL_DIAMETER_MM,
             )
             _cb("fs",
                 f"RPM = {fs.rpm:.0f}  |  "
                 f"feed = {fs.feed_rate_mmpm:.0f} mm/min  |  "
-                f"power = {fs.power_kw:.2f} kW")
+                f"power = {fs.power_kw:.2f} kW  |  mat = {material}")
 
             # ── Stage: toolpath ───────────────────────────────────────────
             _cb("toolpath", "Planning raster toolpath…")
@@ -540,34 +553,124 @@ class FactoryAgent:
                 f"{len(tp.faces)} face(s)  |  "
                 f"path = {tp.total_path_length_mm:.1f} mm")
 
+            # ── Stage: timing stamp ───────────────────────────────────────
+            # Attach t_start/t_end to every Waypoint so the GUI tick-executor
+            # knows exactly when each move is due.
+            t_mach_s = stamp_toolpath(tp, fs, t0=0.0)
+            _cb("toolpath",
+                f"Timing stamped: {t_mach_s:.0f} s = {t_mach_s/60:.1f} min "
+                f"({material})")
+
             # ── Stage: G-code ─────────────────────────────────────────────
             _cb("gcode", "Generating and validating G-code…")
             gc = generate(tp, fs)
+            gc.material = material          # stored for completed-parts log
             _cb("gcode",
                 f"{len(gc.lines)} lines  |  "
-                f"est. time = {gc.estimated_time_s:.0f} s")
+                f"est. time = {t_mach_s:.0f} s  ({material})  "
+                f"— G-code ready, awaiting queue submission")
 
-            # ── Stage: scheduler ─────────────────────────────────────────
-            _cb("schedule", "Submitting job to scheduler queue…")
+            # ── Build Job (NOT yet queued) ─────────────────────────────────
             job = job_from_gcode(gc)
-            if job.estimated_time_s <= 0.0:
-                job.estimated_time_s = 30.0
-            self.scheduler.submit(job)
-            _cb("schedule",
-                f"Job {job.job_id[:8]}…  queued  "
-                f"(depth = {len(self.scheduler.job_queue)})")
-
-            # ── Stage: machine (assigned on next tick) ────────────────────
-            # The scheduler assigns on the next tick_once(); we report the
-            # queue position now and the GUI will see the assignment shortly.
-            _cb("machine",
-                f"Queued — will assign to idle machine on next tick")
+            # Use the stamped machining time (material-aware).
+            job.estimated_time_s = max(t_mach_s, 1.0)
+            job.material         = material
+            # Attach the stamped ToolpathResult so the GUI tick-executor can
+            # use waypoints_due() to advance the G-code cursor in real sim-time
+            # instead of advancing by one line per tick.
+            job.toolpath_result  = tp
+            # job.status remains "queued" only after enqueue_job() is called;
+            # set a sentinel so callers can distinguish CAM-ready from queued.
+            job.status = "cam_ready"
 
             return job
 
         except Exception as exc:
             _cb("error", str(exc))
             return None
+
+    def enqueue_job(
+        self,
+        job: Job,
+        seed: int,
+        progress_cb: Optional[Callable] = None,
+    ) -> Job:
+        """
+        Submit a CAM-ready Job to the scheduler queue.
+
+        This is the second half of the two-phase pipeline:
+          Phase 1  →  build_job_from_seed()   (CAM: solid → G-code)
+          Phase 2  →  enqueue_job()            (scheduler submission)
+
+        The split means the scheduler queue only receives parts that
+        already have fully validated G-code — not parts still being
+        processed by the CAM pipeline.
+
+        Parameters
+        ----------
+        job         : Job returned by build_job_from_seed() (status="cam_ready")
+        seed        : original seed number (used only for progress reporting)
+        progress_cb : same callback as build_job_from_seed()
+
+        Returns
+        -------
+        The same Job, now with status="queued" and assigned to the scheduler.
+        """
+
+        def _cb(phase: str, detail: str = "") -> None:
+            if progress_cb is not None:
+                try:
+                    progress_cb(seed, phase, detail)
+                except Exception:
+                    pass
+
+        # ── Stage: scheduler ─────────────────────────────────────────────
+        _cb("schedule", "Submitting G-code job to scheduler queue…")
+        self.scheduler.submit(job)    # sets job.status = "queued"
+        _cb("schedule",
+            f"Job {job.job_id[:8]}…  queued  "
+            f"(depth = {len(self.scheduler.job_queue)})")
+
+        # ── Stage: machine (assigned on next tick) ────────────────────────
+        # The scheduler assigns on the next tick_once(); we report the
+        # queue position now and the GUI will see the assignment shortly.
+        _cb("machine",
+            "Queued — will assign to idle machine on next tick")
+
+        return job
+
+    def submit_new_seed(
+        self,
+        seed: int,
+        progress_cb: Optional[Callable] = None,
+        generate_if_missing: bool = False,
+    ) -> Optional[Job]:
+        """
+        Convenience wrapper: run the full Phase 1–4 CAM pipeline for *seed*
+        **and** immediately submit the resulting job to the scheduler.
+
+        Internally this calls build_job_from_seed() followed by enqueue_job(),
+        keeping the two-phase contract intact.  Prefer calling those methods
+        directly when you need to separate G-code generation from queuing.
+
+        Parameters
+        ----------
+        seed                : integer seed number
+        progress_cb         : optional callable(seed, phase, detail)
+        generate_if_missing : call Build_Solid.py if .npy is missing
+
+        Returns
+        -------
+        Job if successful, None on any error.
+        """
+        job = self.build_job_from_seed(
+            seed,
+            progress_cb         = progress_cb,
+            generate_if_missing = generate_if_missing,
+        )
+        if job is None:
+            return None
+        return self.enqueue_job(job, seed, progress_cb=progress_cb)
 
     # ── State / KPIs ---------------------------------------------------------
 

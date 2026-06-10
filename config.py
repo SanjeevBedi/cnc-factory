@@ -40,55 +40,112 @@ CNC_FACTORY_DIR: str = _HERE
 # Conda environment that owns OpenCASCADE / pythonocc
 PYOCC_CONDA_ENV: str = "pyocc"
 
-# ── Seed / Timer ──────────────────────────────────────────────────────────────
-# Probability that a new part is created on each GUI simulation step
-# when all machine animation queues are non-empty (background rate).
-# 0.002% = 0.002 / 100 = 2e-5
-# When machines are idle the GUI switches to idle-demand mode (see _auto_seed_tick).
-# Reduced by /10 for each machine whose queue depth exceeds 10.
-SEED_CREATION_PROB: float = 0.002 / 100   # 2e-5  (×10 vs previous 2e-6)
+# ══════════════════════════════════════════════════════════════════════════════
+# TIMING MODEL
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# All timing in the factory uses exactly TWO time quanta:
+#
+#   T_TICK_S  ─ Machine update quantum (the smallest time unit).
+#               One scheduler + animation step = T_TICK_S simulated seconds.
+#               Valid range: 0.25 s … 10 s.  Default: 5 s.
+#
+#   T_G_S     ─ Graphics / dialog update interval.
+#               T_G_S = T_TICK_S × T_G_MULT.
+#               GUI panels and dialog boxes are refreshed every T_G_S sim-s.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# Toolpath waypoints carry t_start and t_end (decimal seconds of sim-time).
+# At each tick (current_sim_time = tick × T_TICK_S) the executor:
+#   • Skips waypoints already tagged (done).
+#   • Executes (tags) all waypoints whose t_end ≤ current_sim_time.
+#   • If part is in unclamp stage: executes unclamp, then waits.
+#   • If part is in clamp stage: changes dialog name/markers, waits one tick.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# SHIFT CAPACITY & SEED PROBABILITY
+# ─────────────────────────────────────────────────────────────────────────────
+#   shift_s            = SIM_SHIFT_HOURS × 3600
+#   ticks_per_shift    = shift_s / T_TICK_S
+#   avg_cycle_s        = T_AVG_MACH_S + PART_SETUP_TIME_S + PART_REMOVAL_TIME_S
+#                        + PART_BUFFER_TIME_S
+#   max_parts_per_mach = floor(shift_s / avg_cycle_s)
+#   total_capacity     = max_parts_per_mach × SIM_N_MACHINES
+#
+# With SIM_IDLE_PCT percent idle time:
+#   target_parts = total_capacity × (1 - SIM_IDLE_PCT/100)
+#   P_seed       = target_parts / ticks_per_shift   (probability per tick)
+#
+# Idle targets (change SIM_IDLE_PCT):
+#   25 % idle  →  base-case / stress test    (start here)
+#   10 % idle  →  normal production rate
+#    5 % idle  →  high-demand / max-load
+# ══════════════════════════════════════════════════════════════════════════════
 
-# Duration of one scheduler tick (seconds)
-T_UNIT_SECONDS: int = 1   # 1 simulated second per scheduler tick
+# ── Machine update quantum ────────────────────────────────────────────────────
+T_TICK_S:    float = 5.0     # simulated seconds per tick  (range 0.25 – 10 s)
+T_G_MULT:    int   = 10      # GUI/dialog update every T_G_MULT ticks
+T_G_S:       float = T_TICK_S * T_G_MULT   # = 50 s  (computed; do not edit)
 
-# ── Simulation loop — three counters ──────────────────────────────────────────
-# Each loop iteration advances SIM_TICK_S simulated seconds.
-# Wall-clock sleep per iteration = SIM_TICK_S / SIM_COMPRESSION  (at 1x speed).
-# Speed slider scales the sleep: wall_sleep = SIM_TICK_S / (SIM_COMPRESSION x speed)
-#
-# Three counters, all driven by the same tick:
-#
-#  1. SCHEDULER  -- fa.tick() called every iteration (T_UNIT_SECONDS = 1)
-#     remaining_s decrements by 1 per tick; job completes after ~T_avg ticks.
-#
-#  2. GUI counter -- accumulates simulated seconds; resets after SIM_GUI_INTERVAL_S.
-#     Dialog boxes refreshed each reset.
-#
-#  3. SEED counter -- accumulates simulated seconds; resets after SIM_SEED_INTERVAL_S.
-#     SIM_SEED_INTERVAL_S = SHIFT_S / parts_per_shift = 28800 / 355 = 81.1 s
-#     ensures exactly 355 seeds are offered per shift.
-#
-# Compression ratio: SHIFT_S / SIM_TARGET_WALL_S = 28800 / 180 = 160x
-SIM_TICK_S:           float = 1.0     # simulated seconds advanced per loop iteration
-SIM_TARGET_WALL_S:    float = 180.0   # wall-clock seconds for one full shift at 1x
-SIM_COMPRESSION:      float = 160.0   # = SHIFT_S / SIM_TARGET_WALL_S
-SIM_GUI_INTERVAL_S:   float = 5.0     # refresh GUI every 5 simulated seconds
-# SIM_SEED_INTERVAL_S = CYCLE_S / N_MACHINES
-# where CYCLE_S = T_avg + PART_SETUP_TIME_S + PART_REMOVAL_TIME_S + PART_BUFFER_TIME_S
-#               = 324.5 + 60 + 60 + 60 = 504.5 s
-# parts/shift   = N x SHIFT_S / CYCLE_S = 4 x 28800 / 504.5 = 228
-# interval      = CYCLE_S / N           = 504.5 / 4          = 126.1 sim-s
-SIM_SEED_INTERVAL_S:  float = 126.1   # sim-s between seed offers  (= CYCLE_S / N)
-SIM_GUI_MAX_FPS:      int   = 30      # hard cap on GUI repaint rate (wall clock)
+# ── Shift parameters ─────────────────────────────────────────────────────────
+SIM_SHIFT_HOURS:   float = 8.0    # shift length (hours)
+SIM_N_MACHINES:    int   = 4      # number of CNC machines
 
-# ── Seed generation ───────────────────────────────────────────────────
-# Every SIM_SEED_INTERVAL_S simulated seconds the loop offers one seed.
-# SIM_SEED_INTERVAL_S = SHIFT_S / parts_per_shift = 28800 / 355 = 81.1 s
-# Safety cap: skip if scheduler queue >= SIM_MAX_QUEUE_AHEAD jobs.
-SIM_T_AVG_S:          float = 324.5   # measured mean machining time (s), cm→mm
-SIM_SHIFT_HOURS:      float = 8.0     # shift length (hours)
-SIM_N_MACHINES:       int   = 4       # number of CNC machines
-SIM_MAX_QUEUE_AHEAD:  int   = 8       # safety cap on scheduler queue depth
+# ── Derived shift counters (do not edit) ─────────────────────────────────────
+_SHIFT_S:           float = SIM_SHIFT_HOURS * 3600.0          # 28 800 s
+_TICKS_PER_SHIFT:   int   = int(_SHIFT_S / T_TICK_S)          # 5 760 ticks
+
+# ── Average machining time ───────────────────────────────────────────────────
+# T_AVG_MACH_S is the mean pure-cutting time (no setup/removal).
+# It is re-computed by timing_model.compute_t_avg() on first GUI start;
+# this constant is the fallback / override used before that computation.
+T_AVG_MACH_S:      float = 900.0   # ≈ 15 min  (fallback; recomputed at runtime)
+
+# ── Idle-time target ─────────────────────────────────────────────────────────
+# SIM_IDLE_PCT controls how busy the machines are.
+#
+# This directly sets the seed-arrival probability:
+#   P = total_capacity × (1 - SIM_IDLE_PCT/100) / ticks_per_shift
+#
+# Debugging ladder (machines clearly idle between jobs → busy factory):
+#   90 % idle  →  trickle mode     ← USE THIS to verify idle/restart cycle
+#   75 % idle  →  light production
+#   50 % idle  →  moderate load
+#   25 % idle  →  base-case / stress test
+#   10 % idle  →  normal production rate
+#    5 % idle  →  high-demand / max-load
+SIM_IDLE_PCT:      float = 3.75    # % of shift time machines are idle
+
+# ── Safety cap on scheduler look-ahead ───────────────────────────────────────
+# SIM_MAX_AHEAD_PER_MACHINE is a PER-MACHINE limit.
+# The effective global cap scales with the number of enabled machines:
+#
+#   back-pressure fires when:  total_q  >= n_enabled × SIM_MAX_AHEAD_PER_MACHINE
+#   overflow guard fires when: total_q  >  n_enabled × SIM_MAX_AHEAD_PER_MACHINE
+#
+# With 4 machines and limit=2  →  cap = 8  (2 jobs ahead per machine)
+# With 1 machine  and limit=2  →  cap = 2  (2 jobs ahead for that machine)
+#
+# Raising this lets the CAM pipeline run further ahead so machines never
+# starve; lowering it keeps memory and queue latency small.
+SIM_MAX_AHEAD_PER_MACHINE: int = 2
+
+# ── Reproducibility ──────────────────────────────────────────────────────────
+# Fixed RNG seed used for ALL random decisions in the simulation:
+#   - auto-seed arrivals (Bernoulli trial each tick)
+#   - seed selection from the library
+#   - material assignment
+# Set to None to get a different random run every time.
+SIM_RNG_SEED: int = 42
+
+# ── Wall-clock speed ─────────────────────────────────────────────────────────
+# GUI speed slider multiplies the wall sleep:  sleep = T_TICK_S / SIM_COMPRESSION / speed
+# SIM_COMPRESSION is chosen so that 1 full shift takes SIM_TARGET_WALL_S seconds at 1×.
+SIM_TARGET_WALL_S:  float = 180.0                                   # 3 min wall-clock per shift at 1×
+SIM_COMPRESSION:    float = _SHIFT_S / SIM_TARGET_WALL_S            # ≈ 160×
+
+# ── GUI repaint cap ───────────────────────────────────────────────────────────
+SIM_GUI_MAX_FPS:   int = 30
 
 # ── Feature Extractor ─────────────────────────────────────────────────────────
 # A face with normal.z > this is a TOP face (machined from above)
@@ -180,12 +237,32 @@ ERROR_WAIT_TICKS: int = 10
 # Maximum reminders before the job is moved to the factory rework queue
 MAX_REMINDERS: int = 4
 
-# ── CNC Agent — part timing ───────────────────────────────────────────────────
+# ── CNC Agent — part timing (all in simulated seconds) ──────────────────────────────────
 TOOL_CHANGE_TIME_S:  float = 120.0   # seconds to swap a tool
-PART_SETUP_TIME_S:   float = 60.0   # seconds to clamp and fixture a part (1 min)
-PART_REMOVAL_TIME_S: float = 60.0   # seconds to unclamp and remove a part  (1 min)
-PART_BUFFER_TIME_S:  float = 60.0   # contingency per cycle: tool change, inspection etc.
+PART_SETUP_TIME_S:   float = 120.0   # seconds to clamp and fixture a part  (2 min)
+PART_REMOVAL_TIME_S: float = 120.0   # seconds to unclamp and remove a part (2 min)
+PART_BUFFER_TIME_S:  float =  60.0   # contingency per cycle
 MANUAL_OVERRIDE_PCT: float = 100.0   # feed-rate override (100 % = nominal)
+
+# Alias so legacy code that imports T_UNIT_SECONDS still works
+T_UNIT_SECONDS: float = T_TICK_S
+
+# ── Material probability weights for random part assignment ───────────────────
+# Each part drawn from the queue is assigned a random material.
+# Weights are proportional; they do NOT have to sum to 1.
+# Heavier materials have lower weights so the mix stays realistic.
+MATERIAL_WEIGHTS: dict = {
+    "aluminium_6061":   0.35,
+    "aluminium_cast":   0.15,
+    "mild_steel_1018":  0.20,
+    "alloy_steel_4140": 0.10,
+    "stainless_304":    0.08,
+    "tool_steel_d2":    0.02,
+    "cast_iron":        0.05,
+    "brass":            0.03,
+    "titanium_ti64":    0.015,
+    "inconel":          0.005,
+}
 
 # ── Cost / amortisation ───────────────────────────────────────────────────────
 MACHINE_CAPITAL_COST_USD: float  = 150_000.0  # purchase price per machine
