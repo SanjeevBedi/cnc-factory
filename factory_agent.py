@@ -417,23 +417,19 @@ class FactoryAgent:
 
     def _manage_tool_cribs(self, tick_num: int) -> list[FactoryCommand]:
         """
-        Detect worn tools and emit FactoryCommands for logging/UI only.
-        NO tool is installed here — the actual swap is deferred to the
-        GUI _tick_machine tool_change countdown so that downtime is
-        correctly accounted for.  install_replacement_tool() does the swap.
+        Detect worn tools and emit FactoryCommands.
+        STOP-level wear triggers immediate replacement from factory inventory
+        so headless runs/tests still enforce tool availability invariants.
+        WARN-level wear remains advisory.
         """
         commands = []
         for agent in self.agents:
             for worn in agent.tool_crib.tools_at_stop():
-                commands.append(FactoryCommand(
-                    command_id        = str(uuid.uuid4()),
-                    target_machine_id = agent.machine_id,
-                    action            = "tool_worn_stop",
-                    payload           = {"tool_id": worn.tool_id,
-                                         "life_pct": worn.remaining_life_pct},
-                    priority          = "critical",
-                    tick_issued       = tick_num,
-                ))
+                cmd = self.install_replacement_tool(
+                    agent=agent, worn=worn, tick_num=tick_num, urgency="stop"
+                )
+                if cmd is not None:
+                    commands.append(cmd)
             for worn in agent.tool_crib.tools_at_warn():
                 commands.append(FactoryCommand(
                     command_id        = str(uuid.uuid4()),
