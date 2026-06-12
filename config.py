@@ -114,7 +114,7 @@ T_AVG_MACH_S:      float = 900.0   # ≈ 15 min  (fallback; recomputed at runtim
 #   25 % idle  →  base-case / stress test
 #   10 % idle  →  normal production rate
 #    5 % idle  →  high-demand / max-load
-SIM_IDLE_PCT:      float = 3.75    # % of shift time machines are idle
+SIM_IDLE_PCT:      float = 10   # % of shift time machines are idle
 
 # ── Safety cap on scheduler look-ahead ───────────────────────────────────────
 # SIM_MAX_AHEAD_PER_MACHINE is a PER-MACHINE limit.
@@ -300,8 +300,8 @@ FACTORY_TOOL_STOCK_PER_SPEC: int = 3
 #
 # ── TEMPORARILY DISABLED — forces rule-based fallback ───────────────────────
 # To re-enable: comment out the override line and uncomment the block below.
-OPENAI_API_KEY: str = ""   # DISABLED
-# OPENAI_API_KEY: str = (
-#     _secrets.get("OPENAI_API_KEY")
-#     or os.environ.get("OPENAI_API_KEY", "")
-# )
+#OPENAI_API_KEY: str = ""   # DISABLED
+OPENAI_API_KEY: str = (
+    _secrets.get("OPENAI_API_KEY")
+    or os.environ.get("OPENAI_API_KEY", "")
+)

@@ -2340,7 +2340,7 @@ class FactoryGUI(tk.Tk):
                     ev.data["speaker"], ev.data["text"], ev.data.get("tag","system"))
 
         elif kind == "manual_error":
-            pass  # handled by AgentConversationWindow._send already
+            pass  # handled by ChatWindow._send already
 
         elif kind == "stream_start":
             panel = self._panels.get(mid)

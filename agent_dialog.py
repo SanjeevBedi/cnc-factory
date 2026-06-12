@@ -41,10 +41,13 @@ import os
 import time
 import uuid
 from enum import Enum
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
 import tkinter as tk
 from tkinter import ttk, filedialog
+
+if TYPE_CHECKING:
+    from factory_gui import GuiEvent
 
 # ── Theme (mirrors factory_gui.py) ───────────────────────────────────────────
 BG     = "#0d1117"
@@ -378,12 +381,19 @@ class AgentConversationWindow(tk.Toplevel):
             return
         self._entry.delete(0, "end")
         self.append("operator", txt)
-        # relay to factory as a manual override
-        self._app._eq.put({
-            "kind": "operator_input",
-            "mid":  self._mid,
-            "text": txt,
-        })
+        
+        # Inject the operator's message as an error to trigger diagnosis
+        agent = next((a for a in self._app.fa.agents
+                      if a.machine_id == self._mid), None)
+        if agent:
+            agent.inject_error(txt)
+            # Trigger the full diagnosis conversation in a background thread
+            import threading
+            threading.Thread(
+                target=self._app._diagnose_disturbance,
+                args=(agent, None, {}, self),
+                daemon=True,
+            ).start()
 
     def _export(self) -> None:
         path = filedialog.asksaveasfilename(
