@@ -212,18 +212,23 @@ class TestFactoryAgent(unittest.TestCase):
     def test_tool_replacement_dispatched(self):
         fa = _factory()
         ag = fa.agents[0]
-        ag.tool_crib.get("T3").remaining_life_hrs = 0.0
+        ag.tool_crib.get("T3").remaining_life_hrs = 0.001
         r  = fa.tick()
-        rcmds = [c for c in r.commands_sent if c.action=="replace_tool"]
-        self.assertGreater(len(rcmds), 0, "Expected replace_tool command")
+        # _manage_tool_cribs now emits tool_worn_stop/warn, not replace_tool
+        rcmds = [c for c in r.commands_sent if c.action in ("tool_worn_stop", "tool_worn_warn")]
+        self.assertGreater(len(rcmds), 0, "Expected tool_worn command")
         self.assertTrue(any(c.target_machine_id=="M01" for c in rcmds))
 
     # 17
     def test_inventory_decrements_on_send(self):
         fa     = _factory()
         before = fa.inventory_count("T3")
-        fa.agents[0].tool_crib.get("T3").remaining_life_hrs = 0.0
-        fa.tick()
+        ag     = fa.agents[0]
+        worn   = ag.tool_crib.get("T3")
+        worn.remaining_life_hrs = 0.001
+        # Manually call install_replacement_tool (GUI would do this)
+        cmd = fa.install_replacement_tool(ag, worn, tick_num=1, urgency="stop")
+        self.assertIsNotNone(cmd, "Expected replacement command")
         self.assertEqual(fa.inventory_count("T3"), before - 1,
             f"T3 inventory {before} -> should be {before-1}")
 

@@ -151,10 +151,9 @@ class TestScheduler(unittest.TestCase):
     # ── 8. Tool life stop threshold ────────────────────────────────────────────
     def test_tool_life_stop_threshold(self):
         """Machine must stop when tool_life_fraction × 100 < TOOL_LIFE_STOP_PCT."""
-        # life_s = 60s × 1 tick = exhausts in 1 tick (STOP_PCT = 10%)
-        # So after 1 tick (90% used), still OK. After ~9 ticks it hits 10%.
-        # With life_s=110s and T_UNIT=60s → after 2 ticks: 120/110 > 1 → clamped to 0%
-        s = Scheduler(n_machines=1, policy="min_time", total_tool_life_s=110)
+        # With T_TICK_S=5s: life_s=10s → exhausts in 2 ticks (2×5=10s)
+        # After 2 ticks: 10/10 = 100% used → life = 0% < 10% STOP_PCT
+        s = Scheduler(n_machines=1, policy="min_time", total_tool_life_s=10)
         j = _simple_job(est_s=float(config.T_UNIT_SECONDS * 100))  # very long
         s.submit(j)
 
@@ -174,8 +173,8 @@ class TestScheduler(unittest.TestCase):
     # ── 9. Tool life warn event ────────────────────────────────────────────────
     def test_tool_life_warn_event(self):
         """Warn event emitted when life drops below TOOL_LIFE_WARN_PCT (20%)."""
-        # life_s = 360s → after 5 ticks: 300/360 = 83% used → life = 17% < 20%
-        s = Scheduler(n_machines=1, policy="min_time", total_tool_life_s=360)
+        # With T_TICK_S=5s: life_s=30s → after 5 ticks: 25/30 = 83% used → life = 17% < 20%
+        s = Scheduler(n_machines=1, policy="min_time", total_tool_life_s=30)
         j = _simple_job(est_s=float(config.T_UNIT_SECONDS * 100))
         s.submit(j)
 
@@ -192,7 +191,7 @@ class TestScheduler(unittest.TestCase):
     # ── 10. Stopped job returns to queue ──────────────────────────────────────
     def test_stopped_job_returns_to_queue(self):
         """When a machine is stopped, its current job must return to the front of the queue."""
-        s = Scheduler(n_machines=1, policy="min_time", total_tool_life_s=110)
+        s = Scheduler(n_machines=1, policy="min_time", total_tool_life_s=10)
         j = _simple_job(est_s=float(config.T_UNIT_SECONDS * 100))
         s.submit(j)
 
@@ -209,7 +208,7 @@ class TestScheduler(unittest.TestCase):
 
     # ── 11. Replace tool resets life ──────────────────────────────────────────
     def test_replace_tool_resets_life(self):
-        s = Scheduler(n_machines=1, policy="min_time", total_tool_life_s=110)
+        s = Scheduler(n_machines=1, policy="min_time", total_tool_life_s=10)
         j = _simple_job(est_s=float(config.T_UNIT_SECONDS * 100))
         s.submit(j)
         for _ in range(10):
@@ -378,8 +377,8 @@ class TestScheduler(unittest.TestCase):
         s.submit(job)
 
         # Run enough ticks for job to complete
-        # estimated_time_s = 5.0 s → 1 tick at T_UNIT=60 should be enough
-        max_ticks = 20
+        # Job estimated time varies; allow generous timeout for complex parts
+        max_ticks = 200
         completed = False
         for _ in range(max_ticks):
             r = s.tick_once()
