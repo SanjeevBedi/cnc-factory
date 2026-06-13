@@ -417,10 +417,17 @@ class FactoryAgent:
 
     def _manage_tool_cribs(self, tick_num: int) -> list[FactoryCommand]:
         """
-        Detect worn tools and emit FactoryCommands for logging/UI only.
-        NO tool is installed here — the actual swap is deferred to the
-        GUI _tick_machine tool_change countdown so that downtime is
-        correctly accounted for.  install_replacement_tool() does the swap.
+        Detect worn tools and emit FactoryCommands.
+
+        STOP-level tools: emit tool_worn_stop notification, then immediately
+        dispatch a replacement from inventory (replace_tool command) so that
+        inventory is decremented within the same tick.  The GUI's
+        install_replacement_tool() path is used for deferred swaps triggered
+        by the tool-change countdown; this path handles the headless / non-GUI
+        case (tests, run() loops, etc.).
+
+        WARN-level tools: emit tool_worn_warn for UI logging only — the actual
+        swap is deferred until the GUI countdown completes.
         """
         commands = []
         for agent in self.agents:
@@ -434,6 +441,12 @@ class FactoryAgent:
                     priority          = "critical",
                     tick_issued       = tick_num,
                 ))
+                # Immediately dispatch a replacement from factory inventory
+                replace_cmd = self.install_replacement_tool(
+                    agent, worn, tick_num, urgency="stop"
+                )
+                if replace_cmd is not None:
+                    commands.append(replace_cmd)
             for worn in agent.tool_crib.tools_at_warn():
                 commands.append(FactoryCommand(
                     command_id        = str(uuid.uuid4()),
