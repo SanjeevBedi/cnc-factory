@@ -379,29 +379,47 @@ def build_suggestions_block(
 
 # Keyword sets that map operator text → likely query intent
 _QUERY_KEYWORDS: dict[str, list[str]] = {
-    "query_tool_crib":          ["tool crib", "tools in", "what tools", "list tools",
-                                  "crib", "all tools", "show tools", "available tools"],
-    "query_tool_life":          ["tool life", "life remaining", "wear", "worn", "life pct",
-                                  "how much life", "tool condition"],
-    "query_status":             ["status", "what is the machine", "machine state",
-                                  "what's happening", "current state"],
+    # tool crib / specific tool property
+    "query_tool_crib":          ["tool crib", "tools in crib", "what tools", "list tools",
+                                  "all tools", "show tools", "available tools",
+                                  "what is in", "what's in", "in the crib",
+                                  "crib contents"],
+    "query_status":             ["status", "machine state",
+                                  "what is the machine", "what's happening",
+                                  "current state", "is the machine"],
+    "query_tool_life":          ["tool life", "life remaining", "wear", "worn",
+                                  "how much life", "tool condition", "life pct",
+                                  "how worn"],
+    "query_tool_detail":        ["radius", "diameter", "shank", "flute",
+                                  "flutes", "tool t", "details of t",
+                                  "show t", "tell me about t",
+                                  "spec of", "specification",
+                                  "properties of"],
     "query_queue":              ["queue", "queued jobs", "jobs waiting", "backlog",
-                                  "what jobs", "next job"],
-    "query_cycle_time":         ["cycle time", "how long", "machining time", "time for job",
-                                  "estimated time"],
-    "query_cost":               ["cost", "how much does", "job cost", "total cost"],
-    "query_power":              ["power", "spindle load", "kw", "watt"],
+                                  "what jobs", "next job", "how many jobs"],
+    "query_cycle_time":         ["cycle time", "how long", "machining time",
+                                  "time for job", "estimated time", "how fast"],
+    "query_cost":               ["cost", "how much does", "job cost", "total cost",
+                                  "price", "usd"],
+    "query_power":              ["power", "spindle load", "kw", "watt", "power draw"],
     "query_feed_rpm":           ["feed rate", "rpm", "spindle speed", "cutting speed",
-                                  "feed and speed", "feeds and speeds"],
-    "query_material":           ["material", "what material", "workpiece material"],
+                                  "feed and speed", "feeds and speeds", "feedrate",
+                                  "what speed", "what feed"],
+    "query_material":           ["material", "what material", "workpiece material",
+                                  "what alloy", "what grade"],
     "query_program":            ["program", "g-code", "gcode", "current program",
-                                  "what program", "which program"],
+                                  "what program", "which program", "what is loaded"],
     "query_execution_history":  ["history", "last jobs", "previous jobs", "executed",
-                                  "job history"],
-    "query_error_log":          ["error", "errors", "error log", "fault", "alarms"],
+                                  "job history", "past jobs"],
+    "query_error_log":          ["error log", "fault", "alarms", "error history",
+                                  "what errors", "what went wrong"],
 }
 
 # Words that signal a disturbance / action request rather than a query
+import re as _re
+# Pattern that matches T1, T2, … T99 as a standalone token
+_TOOL_ID_RE = _re.compile(r'\bT(\d{1,2})\b', _re.IGNORECASE)
+
 _ACTION_SIGNALS: list[str] = [
     "abort", "stop", "emergency", "broken", "break", "fail",
     "chatter", "vibration", "overload", "dimension", "rework",
@@ -416,31 +434,55 @@ def classify_message(text: str) -> tuple[str, Optional[str]]:
       ("query",  intent_id)   — a data query; execute directly
       ("action", None)        — a disturbance / action request; route to LLM pipeline
 
-    Classification is keyword-based and fast (no LLM call).
-    Returns the first matching query intent, or ("action", None) if no query matches.
+    Priority:
+      1. Action-signal words short-circuit to ("action", None).
+      2. Query keywords → first matching category.
+      3. Bare tool-ID mention (T1…T10) without action signals → tool detail query.
+      4. Intent_id word in text → use that intent if it is a query category.
+      5. Default: ("action", None).
     """
     lower = text.lower()
 
-    # If the text explicitly names an action signal → treat as action even if
-    # query keywords also match
+    # 1. Action signals override everything
     for sig in _ACTION_SIGNALS:
         if sig in lower:
             return ("action", None)
 
-    # Check query keywords
+    # 2. Keyword scan (order of _QUERY_KEYWORDS dict matters)
     for intent_id, keywords in _QUERY_KEYWORDS.items():
         for kw in keywords:
             if kw in lower:
                 return ("query", intent_id)
 
-    # Check if the text directly names a known intent_id
+    # 3. Bare tool-ID with no other context → treat as detail query
+    if _TOOL_ID_RE.search(text):
+        return ("query", "query_tool_detail")
+
+    # 4. Exact intent_id word
     for intent_id in INTENT_MAP:
         if intent_id.replace("_", " ") in lower or intent_id in lower:
             if INTENT_MAP[intent_id].category == "query":
                 return ("query", intent_id)
 
-    # Default: treat as action / generic disturbance
     return ("action", None)
+
+
+def extract_parameters(text: str, intent_id: str) -> dict:
+    """
+    Extract structured parameters from free-text for the given intent.
+    Used so handlers can answer questions like 'radius of T1' precisely.
+    """
+    params: dict = {}
+    # Tool ID: T1 … T99
+    m = _TOOL_ID_RE.search(text)
+    if m:
+        params["tool_id"] = f"T{m.group(1)}"
+    # Number of items (for history / error log)
+    n_m = _re.search(r'\blast\s+(\d+)\b|\b(\d+)\s+(?:jobs|items|events)\b',
+                     text, _re.IGNORECASE)
+    if n_m:
+        params["n"] = int(next(v for v in n_m.groups() if v))
+    return params
 
 
 # ── Intent executor ───────────────────────────────────────────────────────────
@@ -640,6 +682,41 @@ class IntentExecutor:
 
     def _do_query_error_log(self, p: dict) -> dict:
         return self._do_query_execution_history(p)
+
+    def _do_query_tool_detail(self, p: dict) -> dict:
+        """Return full details for a specific tool or all tools if none specified."""
+        tools = self._agent.tool_crib.state_list()
+        tool_id = p.get("tool_id")
+        if tool_id:
+            tools = [t for t in tools if t["tool_id"].upper() == tool_id.upper()]
+        if not tools:
+            result = f"Tool {tool_id or '?'} not found in crib for {self._agent.machine_id}."
+            return {"intent": "query_tool_detail", "result": result, "raw": []}
+
+        import config as _cfg
+        lines = [f"Tool detail — {self._agent.machine_id}:"]
+        for t in tools:
+            dia      = t.get("diameter_mm", 0)
+            radius   = dia / 2.0
+            life     = t.get("remaining_life_pct", 0)
+            life_hrs = t.get("remaining_life_hrs", 0)
+            bar_len  = max(0, min(20, int(life / 5)))
+            bar      = "█" * bar_len + "░" * (20 - bar_len)
+            status   = ("⛔ NEEDS REPLACEMENT" if t.get("needs_replacement")
+                        else ("⚠ WARN — replace soon" if life < 20 else "✓ OK"))
+            lines += [
+                f"",
+                f"  {t['tool_id']}  —  {t.get('label', 'End mill')}",
+                f"  ├─ Diameter       : {dia:.1f} mm",
+                f"  ├─ Radius         : {radius:.2f} mm",
+                f"  ├─ Inserts/flutes : {t.get('n_inserts', '—')}",
+                f"  ├─ Shank length   : {t.get('shank_length_mm', '—')} mm",
+                f"  ├─ Tool type      : {t.get('tool_type', '—')}",
+                f"  ├─ Life remaining : [{bar}] {life:.1f}%  ({life_hrs:.2f} hrs)",
+                f"  ├─ Cost/hr        : ${t.get('cost_per_edge_usd', 0):.2f}",
+                f"  └─ Status         : {status}",
+            ]
+        return {"intent": "query_tool_detail", "result": "\n".join(lines), "raw": tools}
 
     def _do_unknown(self, p: dict) -> dict:
         return {"intent": "unknown", "result": "Intent not recognised or not executable.", "raw": {}}

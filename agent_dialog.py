@@ -389,15 +389,16 @@ class AgentConversationWindow(tk.Toplevel):
 
         # ── Classify: query vs disturbance action ─────────────────────────
         import threading
-        from agent_intents import classify_message, IntentExecutor
+        from agent_intents import classify_message, IntentExecutor, extract_parameters
 
         msg_type, intent_id = classify_message(txt)
 
         if msg_type == "query":
             # Direct answer path — no error injection, no LLM pipeline
+            params = extract_parameters(txt, intent_id)
             threading.Thread(
                 target=self._answer_query,
-                args=(agent, intent_id, {}),
+                args=(agent, intent_id, params),
                 daemon=True,
             ).start()
         else:
@@ -417,12 +418,10 @@ class AgentConversationWindow(tk.Toplevel):
         cw = self   # conversation window
 
         def post(speaker, text):
-            """Thread-safe append to the chat log."""
-            self._app._eq.put(
-                __import__('factory_gui', fromlist=['GuiEvent'])
-                .GuiEvent("chat_append", self._mid,
-                          {"speaker": speaker, "text": text, "tag": "system"})
-            )
+            """Thread-safe append via the app's post_chat helper.
+            Avoids a circular import — factory_gui imports agent_dialog,
+            so agent_dialog must NOT import factory_gui at runtime."""
+            self._app.post_chat(self._mid, speaker, text)
 
         executor = IntentExecutor(agent, self._app.fa)
 

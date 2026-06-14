@@ -1939,6 +1939,12 @@ class FactoryGUI(tk.Tk):
         ).start()
 
     # legacy shim for --demo-break CLI path
+    def post_chat(self, mid: str, speaker: str, text: str) -> None:
+        """Thread-safe helper: post a chat_append event to the GUI poll loop.
+        Called by agent_dialog._answer_query to avoid a circular import."""
+        self._eq.put(GuiEvent("chat_append", mid,
+                              {"speaker": speaker, "text": text}))
+
     def inject_error(self, machine_id: str, description: str) -> None:
         key   = None
         extra = {}
