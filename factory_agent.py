@@ -203,13 +203,24 @@ class FactoryAgent:
         # The GUI uses agent.part_queue to read gcode_lines for animation.
         # Bridge the gap: when the scheduler assigns a new job, push it
         # into the matching agent's part_queue (if not already there).
+        # ── Idle / active tracking ────────────────────────────────────────
+        # agent.status is set by the GUI _MachSim tick — it is the
+        # authoritative source. Read it directly here instead of through
+        # the scheduler Machine objects, which never receive jobs in GUI
+        # mode (jobs go into _msim.queue, bypassing scheduler.job_queue).
+        for agent in self.agents:
+            if agent.status in ("running", "awaiting_factory",
+                                "awaiting_tool_change"):
+                self.ledger.machine_became_active(agent.machine_id, tick_num)
+            elif agent.status == "idle":
+                self.ledger.machine_went_idle(
+                    agent.machine_id, tick_num, reason="no_jobs")
+            # "stopped" / unknown statuses keep whichever event is open
+
         sched_machines = {m.machine_id: m for m in self.scheduler.machines}
         for agent in self.agents:
             sm = sched_machines.get(agent.machine_id)
             if sm is None or sm.current_job is None:
-                if agent.status == "idle":
-                    self.ledger.machine_went_idle(
-                        agent.machine_id, tick_num, reason="no_jobs")
                 continue
             job = sm.current_job
             # Only enqueue if this job isn't already in the agent's queue
@@ -219,7 +230,6 @@ class FactoryAgent:
             if not already_queued and agent.current_job is None:
                 agent.part_queue.append(job)
                 agent.status = "running"   # mark as active for display
-                self.ledger.machine_became_active(agent.machine_id, tick_num)
                 self.ledger.record_allocated(
                     job.job_id, agent.machine_id, self.policy, tick_num)
 
