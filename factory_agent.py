@@ -22,6 +22,7 @@ import copy
 import json
 import os
 import uuid
+from agent_intents import build_system_context, build_suggestions_block
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Callable, Optional
@@ -291,19 +292,24 @@ class FactoryAgent:
     # ── LLM ------------------------------------------------------------------
 
     def _build_llm_prompt(self, ctx: ErrorContext) -> str:
+        capability_block = build_system_context(ctx.machine_id)
+        suggestions      = build_suggestions_block(
+            possible_actions=("continue", "reduce_feed", "rework", "abort")
+        )
         return (
-            "You are the factory supervisor LLM for an autonomous CNC machining factory.\n"
-            f"Active policy: {ctx.factory_policy}\n\n"
-            "Respond with a JSON object containing exactly:\n"
-            '  "action"     : one of ["continue","reduce_feed","rework","abort"]\n'
-            '  "parameters" : dict  (e.g. {"feed_override_pct": 80})\n'
-            '  "risk_level" : one of ["safe","risky","catastrophic"]\n'
-            '  "reasoning"  : one sentence\n\n'
-            f"Machine  : {ctx.machine_id}\n"
-            f"Error    : {ctx.error_description}\n"
-            f"Section  : {ctx.error_section}\n"
-            f"G-code   : {ctx.error_gcode_line}\n"
-            f"Tool life: {ctx.tool_life_pct:.1f}%\n"
+            f"{capability_block}\n\n"
+            f"Active policy : {ctx.factory_policy}\n"
+            f"Machine       : {ctx.machine_id}\n"
+            f"Error         : {ctx.error_description}\n"
+            f"Section       : {ctx.error_section}\n"
+            f"G-code line   : {ctx.error_gcode_line}\n"
+            f"Tool life     : {ctx.tool_life_pct:.1f}%\n"
+            f"Queue depth   : {ctx.queue_depth}\n\n"
+            f"{suggestions}\n\n"
+            "Respond with JSON only (no prose outside the object).\n"
+            '{"intent":"<intent_id>","parameters":{...},'
+            '"risk_level":"safe|risky|catastrophic",'
+            '"reasoning":"<one concise sentence>"}\n'
         )
 
     def _call_openai(self, ctx: ErrorContext) -> list[LLMResponse]:
@@ -317,7 +323,7 @@ class FactoryAgent:
                     temperature = temp,
                     messages    = [
                         {"role": "system",
-                         "content": "CNC factory supervisor. Respond only with valid JSON."},
+                         "content": build_system_context(ctx.machine_id, include_examples=False)},
                         {"role": "user", "content": prompt},
                     ],
                 )

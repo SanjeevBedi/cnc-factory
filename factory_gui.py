@@ -1279,6 +1279,52 @@ class FactoryGUI(tk.Tk):
     def step_sim(self) -> None:
         self._do_sim_step()
 
+    def _push_to_sim(self, mid: str, gcode_lines: list) -> None:
+        """
+        Send the full G-code program to the 3-D simulator for *mid* via
+        POST /program.  The G-code already contains TOOL SHAPE / TOOL SIZE /
+        STOCK SIZE / STOCK POS so the simulator reconfigures itself completely
+        before cutting.
+
+        Only runs if the simulator process for this machine is alive.
+        Errors are suppressed silently when the simulator is not running.
+        """
+        if not _REQUESTS_AVAILABLE:
+            return
+        panel = self._panels.get(mid)
+        if panel is None or panel._sim_proc is None or panel._sim_proc.poll() is not None:
+            return   # simulator not launched for this machine
+        port = SIM_PORTS.get(mid)
+        if port is None:
+            return
+        base_url = f"http://127.0.0.1:{port}"
+        try:
+            resp = _requests.post(
+                f"{base_url}/program",
+                json={
+                    "lines": gcode_lines,
+                    "apply_cut": True,
+                    "ensure_m30": False,   # keep tool at final position
+                    "update_ui": True,
+                },
+                timeout=60,
+            )
+            if resp.status_code == 200:
+                self._fpanel.log(
+                    f"🖥  {mid} → simulator program OK "
+                    f"({len(gcode_lines)} lines)", "ok")
+                # Request UI refresh so poll_state picks up changes
+                try:
+                    _requests.post(f"{base_url}/ui/refresh", timeout=5)
+                except Exception:
+                    pass
+            else:
+                self._fpanel.log(
+                    f"⚠ {mid} simulator HTTP {resp.status_code}: "
+                    f"{resp.text[:80]}", "warn")
+        except Exception as exc:
+            self._fpanel.log(f"⚠ {mid} simulator unreachable: {exc}", "warn")
+
     def _on_speed(self, _=None) -> None:
         """Speed slider: scales wall-clock sleep per tick."""
         self._speed = max(0.1, min(10.0, self._speed_var.get()))
@@ -1663,6 +1709,13 @@ class FactoryGUI(tk.Tk):
                     panel.set_machining_label(msim.current_job.seed, "▶")
                 self._eq.put(GuiEvent("gcode_step", mid,
                                       {"lines": msim.gcode_lines, "cursor": 0}))
+                # Push full program to 3-D simulator (only if launched)
+                _lines = msim.gcode_lines[:]
+                threading.Thread(
+                    target=self._push_to_sim,
+                    args=(mid, _lines),
+                    daemon=True,
+                ).start()
 
         elif msim.status == "machining":
             lines     = msim.gcode_lines
