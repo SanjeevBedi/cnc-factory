@@ -1228,6 +1228,14 @@ class FactoryGUI(tk.Tk):
                 continue
 
             self._msim[dest].queue.append(job)   # enqueue to pre-chosen machine
+            # ── Ledger: record job queued ──────────────────────────────────────
+            self.fa.ledger.record_queued(
+                job.job_id, seed, job.estimated_time_s,
+                getattr(job, "material", "unknown"),
+                self.fa.scheduler.tick,
+            )
+            self.fa.ledger.record_allocated(
+                job.job_id, dest, self.fa.policy, self.fa.scheduler.tick)
 
             self._fpanel.log(
                 f"📄 Seed {seed}  G-code ready  "
@@ -1482,6 +1490,38 @@ class FactoryGUI(tk.Tk):
         stats["tool_d_mm"] = tool_d
         self._completed_parts.append(stats)
         self.fa.total_jobs_completed += 1   # scheduler bypassed; track manually
+
+        # ── Ledger: upsert this job as finished ────────────────────────────
+        # Jobs reach here via _msim (not enqueue_job), so
+        # record_queued may never have been called.  Create the
+        # full lifecycle entry now from the data already in hand.
+        _ledger = self.fa.ledger
+        if job.job_id not in _ledger.parts:
+            _ledger.record_queued(
+                job.job_id, job.seed, job.estimated_time_s,
+                getattr(job, "material", "unknown"), tick_done)
+            _ledger.record_allocated(
+                job.job_id, mid, self.fa.policy, tick_done)
+            _ledger.record_started(job.job_id, tick_done)
+        _lrec = _ledger.parts.get(job.job_id)
+        if _lrec and _lrec.status not in ("done", "rework"):
+            _ledger.record_finished(
+                job.job_id, tick_done, actual_time_s=mach_s)
+            if tool_id and tool_id not in _lrec.tools_used:
+                _lrec.tools_used.append(tool_id)
+        # Record tool-use event
+        if tool_id:
+            _ag2 = next((a for a in self.fa.agents
+                         if a.machine_id == mid), None)
+            if _ag2:
+                _tr2 = _ag2.tool_crib.get(tool_id)
+                if _tr2:
+                    _ledger.record_tool_event(
+                        tick_done, mid, tool_id, "used",
+                        life_pct=_tr2.remaining_life_pct,
+                        diameter_mm=_tr2.diameter_mm,
+                        message=f"Seed {job.seed} completed",
+                    )
         # Update status in _all_jobs tracking list
         for entry in self._all_jobs:
             if entry.get("job_id") == job.job_id:
@@ -1861,6 +1901,14 @@ class FactoryGUI(tk.Tk):
                 return
 
             self._msim[dest].queue.append(job)   # enqueue to pre-chosen machine
+            # ── Ledger: record job queued ──────────────────────────────────────
+            self.fa.ledger.record_queued(
+                job.job_id, seed, job.estimated_time_s,
+                getattr(job, "material", "unknown"),
+                self.fa.scheduler.tick,
+            )
+            self.fa.ledger.record_allocated(
+                job.job_id, dest, self.fa.policy, self.fa.scheduler.tick)
 
             self._fpanel.log(
                 f"📄 Auto-seed {seed}  G-code ready  "

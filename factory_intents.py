@@ -862,6 +862,9 @@ class FactoryIntentExecutor:
         kpis  = self._fa.get_production_kpis()
         tick  = self._tick()
         t_s   = self._t_real_s()
+        # Use GUI completed-parts count if available (more accurate in _MachSim mode)
+        gui_done_count = len(getattr(self._app, "_completed_parts", []))
+        completed_count = max(kpis["total_jobs_completed"], gui_done_count)
         lines = [
             f"Factory Status — tick {tick}  "
             f"(sim time {t_s/60:.1f} min)  policy: {self._fa.policy}",
@@ -871,7 +874,7 @@ class FactoryIntentExecutor:
             f"  Machines stopped/waiting  : {kpis['machines_stopped']}",
             f"  Awaiting factory response : {kpis['machines_awaiting_factory']}",
             f"",
-            f"  Jobs completed            : {kpis['total_jobs_completed']}",
+            f"  Jobs completed            : {completed_count}",
             f"  Jobs in rework            : {kpis['rework_queue_depth']}",
             f"  Jobs in scheduler queue   : {kpis['scheduler_queue_depth']}",
             f"",
@@ -972,33 +975,32 @@ class FactoryIntentExecutor:
                 "result": "\n".join(lines), "raw": []}
 
     def _do_factory_machined_parts(self, p: dict) -> dict:
+        """
+        Data-source priority (the GUI bypasses fa.enqueue_job so the scheduler
+        never sees most jobs):
+          1. FactoryLedger.completed_parts()  — populated since fix of 2025-06-14
+          2. self._app._completed_parts       — GUI's own tracking (always correct)
+          3. fa.scheduler.completed_jobs      — scheduler path (rarely used in GUI mode)
+        """
         n      = int(p.get("n", 10))
-        done   = self._ledger.completed_parts(n)
         lines  = [f"Completed parts (last {n}):"]
-        if not done:
-            # Fall back to scheduler completed jobs
-            sched_done = self._fa.scheduler.completed_jobs[-n:]
-            if sched_done:
-                lines.append(
-                    f"  (Ledger empty — showing last {len(sched_done)} "
-                    f"from scheduler log)"
-                )
-                for j in reversed(sched_done):
-                    lines.append(
-                        f"  Seed {j.seed}  Job {j.job_id[:8]}…  "
-                        f"machine={j.assigned_machine_id or '?'}  "
-                        f"material={j.material}  "
-                        f"est={j.estimated_time_s/60:.1f} min"
-                    )
-            else:
-                lines.append("  No completed parts yet.")
-        else:
+
+        # ── Source 1: ledger ─────────────────────────────────────────────
+        done_ledger = self._ledger.completed_parts(n)
+
+        # ── Source 2: GUI _completed_parts list ──────────────────────────
+        gui_done = []
+        if self._app is not None:
+            gui_done = list(getattr(self._app, "_completed_parts", []))
+
+        if done_ledger:
+            # Ledger is populated — show it (richest data)
             lines.append(
                 f"  {'Seed':<8} {'Machine':<6} {'Material':<22} "
                 f"{'Est(min)':>8} {'Act(min)':>8} {'Cost$':>7} {'Errors':>6}"
             )
             lines.append("  " + "─" * 70)
-            for r in done:
+            for r in done_ledger:
                 lines.append(
                     f"  {str(r.seed):<8} {r.machine_id:<6} {r.material:<22} "
                     f"{r.estimated_time_s/60:>8.1f} "
@@ -1007,8 +1009,53 @@ class FactoryIntentExecutor:
                     f"{r.error_count:>6}"
                     + (" ⚠REWORK" if r.rework else "")
                 )
+            return {"intent": "factory_machined_parts",
+                    "result": "\n".join(lines), "raw": done_ledger}
+
+        if gui_done:
+            # GUI list is the authoritative runtime source
+            gui_recent = gui_done[-n:]
+            total      = len(gui_done)
+            lines.append(f"  Showing last {len(gui_recent)} of {total} total completions:")
+            lines.append("")
+            lines.append(
+                f"  {'#':<4} {'Seed':<8} {'Machine':<6} {'Tool':<6} "
+                f"{'Mach(min)':>10} {'Total(min)':>11} {'Tick':>6}"
+            )
+            lines.append("  " + "─" * 60)
+            for i, cp in enumerate(reversed(gui_recent), 1):
+                seed    = cp.get("seed", "?")
+                machine = cp.get("machine", "?")
+                tool    = cp.get("tool_id", "—")
+                mach_m  = cp.get("machining_s", 0) / 60
+                total_m = cp.get("total_s", 0) / 60
+                tick_d  = cp.get("tick_done", "?")
+                lines.append(
+                    f"  {i:<4} {str(seed):<8} {machine:<6} {str(tool):<6} "
+                    f"{mach_m:>10.1f} {total_m:>11.1f} {str(tick_d):>6}"
+                )
+            return {"intent": "factory_machined_parts",
+                    "result": "\n".join(lines), "raw": gui_recent}
+
+        # ── Source 3: scheduler completed_jobs ───────────────────────────
+        sched_done = self._fa.scheduler.completed_jobs[-n:]
+        if sched_done:
+            lines.append(
+                f"  (scheduler log — {len(sched_done)} job(s))"
+            )
+            for j in reversed(sched_done):
+                lines.append(
+                    f"  Seed {j.seed}  Job {j.job_id[:8]}\u2026  "
+                    f"machine={j.assigned_machine_id or '?'}  "
+                    f"material={j.material}  "
+                    f"est={j.estimated_time_s/60:.1f} min"
+                )
+            return {"intent": "factory_machined_parts",
+                    "result": "\n".join(lines), "raw": sched_done}
+
+        lines.append("  No completed parts yet — parts complete shortly after machining starts.")
         return {"intent": "factory_machined_parts",
-                "result": "\n".join(lines), "raw": done}
+                "result": "\n".join(lines), "raw": []}
 
     def _do_factory_queue(self, p: dict) -> dict:
         queue = list(self._fa.scheduler.job_queue)
@@ -1033,17 +1080,37 @@ class FactoryIntentExecutor:
         n    = int(p.get("n", 20))
         log  = self._ledger.allocation_log[-n:]
         lines = [f"Schedule / allocation history (last {n}):"]
-        if not log:
-            lines.append("  No allocations recorded yet.")
-        else:
+        if log:
             lines.append(
                 f"  {'Tick':<6} {'Job ID':<14} {'Machine':<8} {'Policy'}"
             )
             lines.append("  " + "─" * 50)
-            for tick, job_id, machine_id, policy in log:
+            for tick_v, job_id, machine_id, policy in log:
                 lines.append(
-                    f"  {tick:<6} {job_id[:12]:<14} {machine_id:<8} {policy}"
+                    f"  {tick_v:<6} {job_id[:12]:<14} {machine_id:<8} {policy}"
                 )
+        else:
+            # Fall back to GUI _all_jobs tracking list
+            all_jobs = list(getattr(self._app, "_all_jobs", []))
+            if all_jobs:
+                recent = all_jobs[-n:]
+                lines.append(
+                    f"  (from GUI job registry — {len(all_jobs)} total submitted)"
+                )
+                lines.append(
+                    f"  {'Seed':<8} {'Job ID':<14} {'Machine':<8} {'Status':<10} {'Lines'}"
+                )
+                lines.append("  " + "─" * 55)
+                for entry in reversed(recent):
+                    lines.append(
+                        f"  {str(entry.get('seed','?')):<8} "
+                        f"{entry.get('job_id','')[:12]:<14} "
+                        f"{entry.get('machine','?'):<8} "
+                        f"{entry.get('status','?'):<10} "
+                        f"{entry.get('lines',0)}"
+                    )
+            else:
+                lines.append("  No schedule history yet.")
         return {"intent": "factory_schedule_history",
                 "result": "\n".join(lines), "raw": log}
 
@@ -1053,8 +1120,54 @@ class FactoryIntentExecutor:
         tick       = self._tick()
 
         if not summary:
-            # Fall back to live agent status
-            lines = ["Idle time — (ledger empty, reading live agent status):"]
+            # Fallback A: compute from GUI _completed_parts if available
+            gui_done = []
+            if self._app is not None:
+                gui_done = list(getattr(self._app, "_completed_parts", []))
+
+            if gui_done and tick > 0:
+                # Estimate busy time per machine from job records, then infer idle
+                from collections import defaultdict
+                busy_ticks: dict = defaultdict(float)
+                counts: dict     = defaultdict(int)
+                for cp in gui_done:
+                    mid2   = cp.get("machine", "")
+                    mach_s = cp.get("machining_s", 0) + cp.get("load_s", 0) + cp.get("unload_s", 0)
+                    import config as _cfg
+                    busy_ticks[mid2] += mach_s / _cfg.T_TICK_S
+                    counts[mid2]     += 1
+
+                lines = [
+                    f"Idle time estimate — tick {tick}  "
+                    f"(derived from {len(gui_done)} completed jobs):"
+                ]
+                lines.append(
+                    f"  {'Machine':<8} {'Busy ticks':>12} {'Idle ticks':>12} "
+                    f"{'Idle %':>8} {'Jobs done':>10}"
+                )
+                lines.append("  " + "─" * 56)
+                mids = sorted(set(cp.get("machine","") for cp in gui_done if cp.get("machine")))
+                for mid2 in mids:
+                    if machine_id and mid2 != machine_id:
+                        continue
+                    bt   = busy_ticks[mid2]
+                    it   = max(0, tick - bt)
+                    pct  = (it / tick * 100) if tick > 0 else 0.0
+                    n_j  = counts[mid2]
+                    lines.append(
+                        f"  {mid2:<8} {bt:>12.0f} {it:>12.0f} {pct:>7.1f}%  {n_j:>10}"
+                    )
+                # Show currently idle machines
+                for ag in self._fa.agents:
+                    if machine_id and ag.machine_id != machine_id:
+                        continue
+                    if ag.status == "idle":
+                        lines.append(f"  {ag.machine_id}  ← currently idle")
+                return {"intent": "factory_idle_time",
+                        "result": "\n".join(lines), "raw": {}}
+
+            # Fallback B: live agent status only
+            lines = ["Idle time — (reading live agent status):"]
             for ag in self._fa.agents:
                 if machine_id and ag.machine_id != machine_id:
                     continue
