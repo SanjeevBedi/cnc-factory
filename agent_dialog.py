@@ -377,23 +377,65 @@ class AgentConversationWindow(tk.Toplevel):
 
     def _send(self, _=None) -> None:
         txt = self._entry.get().strip()
-        if not txt or txt.startswith("Add context"):
+        if not txt or txt.startswith("Add context") or txt.startswith("Type intent"):
             return
         self._entry.delete(0, "end")
         self.append("operator", txt)
-        
-        # Inject the operator's message as an error to trigger diagnosis
+
         agent = next((a for a in self._app.fa.agents
                       if a.machine_id == self._mid), None)
-        if agent:
+        if agent is None:
+            return
+
+        # ── Classify: query vs disturbance action ─────────────────────────
+        import threading
+        from agent_intents import classify_message, IntentExecutor
+
+        msg_type, intent_id = classify_message(txt)
+
+        if msg_type == "query":
+            # Direct answer path — no error injection, no LLM pipeline
+            threading.Thread(
+                target=self._answer_query,
+                args=(agent, intent_id, {}),
+                daemon=True,
+            ).start()
+        else:
+            # Action / disturbance path — full diagnosis pipeline
             agent.inject_error(txt)
-            # Trigger the full diagnosis conversation in a background thread
-            import threading
             threading.Thread(
                 target=self._app._diagnose_disturbance,
                 args=(agent, None, {}, self),
                 daemon=True,
             ).start()
+
+    def _answer_query(self, agent, intent_id: str, parameters: dict) -> None:
+        """Execute a query intent and stream the result into the chat log."""
+        from agent_intents import IntentExecutor, INTENT_MAP, build_system_context
+        import time
+
+        cw = self   # conversation window
+
+        def post(speaker, text):
+            """Thread-safe append to the chat log."""
+            self._app._eq.put(
+                __import__('factory_gui', fromlist=['GuiEvent'])
+                .GuiEvent("chat_append", self._mid,
+                          {"speaker": speaker, "text": text, "tag": "system"})
+            )
+
+        executor = IntentExecutor(agent, self._app.fa)
+
+        # Inject the msim reference so queue queries can read the live queue
+        msim = self._app._msim.get(agent.machine_id)
+        if msim is not None:
+            executor._msim = msim
+
+        result = executor.execute(intent_id, parameters)
+
+        intent_label = INTENT_MAP[intent_id].label if intent_id in INTENT_MAP else intent_id
+        post("factory", f"ℹ {intent_label}")
+        post("machine", result["result"])
 
     def _export(self) -> None:
         path = filedialog.asksaveasfilename(

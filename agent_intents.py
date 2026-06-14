@@ -373,3 +373,273 @@ def build_suggestions_block(
     for i in suggested:
         lines.append(f"  {i.intent_id:<30s} — {i.description[:80]}")
     return "\n".join(lines)
+
+
+# ── Message classification ────────────────────────────────────────────────────
+
+# Keyword sets that map operator text → likely query intent
+_QUERY_KEYWORDS: dict[str, list[str]] = {
+    "query_tool_crib":          ["tool crib", "tools in", "what tools", "list tools",
+                                  "crib", "all tools", "show tools", "available tools"],
+    "query_tool_life":          ["tool life", "life remaining", "wear", "worn", "life pct",
+                                  "how much life", "tool condition"],
+    "query_status":             ["status", "what is the machine", "machine state",
+                                  "what's happening", "current state"],
+    "query_queue":              ["queue", "queued jobs", "jobs waiting", "backlog",
+                                  "what jobs", "next job"],
+    "query_cycle_time":         ["cycle time", "how long", "machining time", "time for job",
+                                  "estimated time"],
+    "query_cost":               ["cost", "how much does", "job cost", "total cost"],
+    "query_power":              ["power", "spindle load", "kw", "watt"],
+    "query_feed_rpm":           ["feed rate", "rpm", "spindle speed", "cutting speed",
+                                  "feed and speed", "feeds and speeds"],
+    "query_material":           ["material", "what material", "workpiece material"],
+    "query_program":            ["program", "g-code", "gcode", "current program",
+                                  "what program", "which program"],
+    "query_execution_history":  ["history", "last jobs", "previous jobs", "executed",
+                                  "job history"],
+    "query_error_log":          ["error", "errors", "error log", "fault", "alarms"],
+}
+
+# Words that signal a disturbance / action request rather than a query
+_ACTION_SIGNALS: list[str] = [
+    "abort", "stop", "emergency", "broken", "break", "fail",
+    "chatter", "vibration", "overload", "dimension", "rework",
+    "change tool", "reduce feed", "increase", "recalculate",
+    "problem", "issue", "wrong", "error", "fault",
+]
+
+
+def classify_message(text: str) -> tuple[str, Optional[str]]:
+    """
+    Classify operator free text as:
+      ("query",  intent_id)   — a data query; execute directly
+      ("action", None)        — a disturbance / action request; route to LLM pipeline
+
+    Classification is keyword-based and fast (no LLM call).
+    Returns the first matching query intent, or ("action", None) if no query matches.
+    """
+    lower = text.lower()
+
+    # If the text explicitly names an action signal → treat as action even if
+    # query keywords also match
+    for sig in _ACTION_SIGNALS:
+        if sig in lower:
+            return ("action", None)
+
+    # Check query keywords
+    for intent_id, keywords in _QUERY_KEYWORDS.items():
+        for kw in keywords:
+            if kw in lower:
+                return ("query", intent_id)
+
+    # Check if the text directly names a known intent_id
+    for intent_id in INTENT_MAP:
+        if intent_id.replace("_", " ") in lower or intent_id in lower:
+            if INTENT_MAP[intent_id].category == "query":
+                return ("query", intent_id)
+
+    # Default: treat as action / generic disturbance
+    return ("action", None)
+
+
+# ── Intent executor ───────────────────────────────────────────────────────────
+
+class IntentExecutor:
+    """
+    Execute query intents directly against the live agent and factory state.
+    Returns a dict with:
+      intent   : intent_id
+      result   : the data (formatted as a human-readable string)
+      raw      : raw Python object for programmatic use
+    """
+
+    def __init__(self, agent, factory_agent):
+        self._agent = agent
+        self._fa    = factory_agent
+
+    def execute(self, intent_id: str, parameters: dict = None) -> dict:
+        parameters = parameters or {}
+        handler = getattr(self, f"_do_{intent_id}", self._do_unknown)
+        return handler(parameters)
+
+    # ── query handlers ────────────────────────────────────────────────────────
+
+    def _do_query_tool_crib(self, p: dict) -> dict:
+        tools = self._agent.tool_crib.state_list()
+        lines = [f"Tool crib — {self._agent.machine_id}  ({len(tools)} tools):",
+                 f"  {'ID':<5} {'Dia':>6}  {'Inserts':>7}  {'Life':>6}  {'Status'}"]
+        lines.append("  " + "─" * 48)
+        for t in tools:
+            life = t.get("remaining_life_pct", 0)
+            status = ("⛔ STOP" if t.get("needs_replacement")
+                      else ("⚠ WARN" if life < 20 else "✓ OK"))
+            lines.append(
+                f"  {t['tool_id']:<5} {t['diameter_mm']:>5.0f}mm  "
+                f"{t['n_inserts']:>7}  {life:>5.1f}%  {status}"
+            )
+        return {"intent": "query_tool_crib", "result": "\n".join(lines), "raw": tools}
+
+    def _do_query_tool_life(self, p: dict) -> dict:
+        tools = self._agent.tool_crib.state_list()
+        tool_id = p.get("tool_id")
+        if tool_id:
+            tools = [t for t in tools if t["tool_id"] == tool_id]
+        lines = [f"Tool life — {self._agent.machine_id}:"]
+        for t in tools:
+            life     = t.get("remaining_life_pct", 0)
+            life_hrs = t.get("remaining_life_hrs", 0)
+            bar_len  = max(0, min(20, int(life / 5)))
+            bar      = "█" * bar_len + "░" * (20 - bar_len)
+            status   = ("⛔ NEEDS REPLACEMENT" if t.get("needs_replacement")
+                        else ("⚠ WARN — replace soon" if life < 20 else "✓ OK"))
+            lines.append(
+                f"  {t['tool_id']}  [{bar}] {life:5.1f}%  "
+                f"({life_hrs:.2f} hrs)  {status}"
+            )
+        return {"intent": "query_tool_life", "result": "\n".join(lines), "raw": tools}
+
+    def _do_query_status(self, p: dict) -> dict:
+        state = self._agent.get_state()
+        lines = [
+            f"Machine status — {self._agent.machine_id}:",
+            f"  Status          : {state['status']}",
+            f"  Current job     : {state.get('current_job') or '—'}",
+            f"  Current seed    : {state.get('current_seed') or '—'}",
+            f"  Section         : {state.get('current_section') or '—'}",
+            f"  Sections done   : {state.get('completed_sections', [])}",
+            f"  Queue depth     : {state.get('queue_depth', 0)}",
+            f"  Rework depth    : {state.get('rework_depth', 0)}",
+            f"  Active error    : {state.get('active_error') or 'None'}",
+            f"  Pending tool Δ  : {state.get('pending_tool_change', False)}",
+        ]
+        return {"intent": "query_status", "result": "\n".join(lines), "raw": state}
+
+    def _do_query_queue(self, p: dict) -> dict:
+        import config as _cfg
+        msim_ref = getattr(self, '_msim', None)   # injected by GUI if available
+        queue_list = []
+        if msim_ref is not None:
+            queue_list = list(msim_ref.queue)
+        state = self._agent.get_state()
+        depth = state.get("queue_depth", len(queue_list))
+        if not queue_list:
+            result = (f"Queue — {self._agent.machine_id}:  "
+                      f"{depth} job(s) queued  (detail not available in dry-run mode)")
+        else:
+            lines = [f"Queue — {self._agent.machine_id}  ({depth} jobs):"]
+            for i, job in enumerate(queue_list):
+                lines.append(
+                    f"  [{i+1}] Seed {getattr(job,'seed','?')}  "
+                    f"~{getattr(job,'estimated_time_s',0)/60:.1f} min  "
+                    f"material={getattr(job,'material','?')}"
+                )
+            result = "\n".join(lines)
+        return {"intent": "query_queue", "result": result, "raw": queue_list}
+
+    def _do_query_cycle_time(self, p: dict) -> dict:
+        agent = self._agent
+        job   = agent.current_job
+        lines = [f"Cycle time — {agent.machine_id}:"]
+        if job:
+            lines += [
+                f"  Estimated mach  : {job.estimated_time_s/60:.1f} min",
+                f"  Setup           : {2.0:.1f} min",
+                f"  Tool change     : 2.5 min (if scheduled)",
+                f"  Unclamp/removal : 2.0 min",
+                f"  Total est.      : {(job.estimated_time_s + 360)/60:.1f} min",
+            ]
+        else:
+            lines.append("  No active job.")
+        return {"intent": "query_cycle_time", "result": "\n".join(lines), "raw": {}}
+
+    def _do_query_cost(self, p: dict) -> dict:
+        agent = self._agent
+        job   = agent.current_job
+        lines = [f"Job cost — {agent.machine_id}:"]
+        if job:
+            cost = agent.compute_cost(job)
+            lines += [
+                f"  Machine cost    : ${cost.get('machine_cost', 0):.4f}",
+                f"  Tool cost       : ${cost.get('tool_cost', 0):.4f}",
+                f"  Total cost      : ${cost.get('total_cost', 0):.4f}",
+            ]
+        else:
+            lines.append("  No active job.")
+        return {"intent": "query_cost", "result": "\n".join(lines), "raw": {}}
+
+    def _do_query_feed_rpm(self, p: dict) -> dict:
+        job = self._agent.current_job
+        lines = [f"Feed & RPM — {self._agent.machine_id}:"]
+        if job and hasattr(job, 'toolpath_result') and job.toolpath_result:
+            lines.append("  (G-code params from last computed toolpath)")
+        lines.append(
+            f"  Feed rate       : "
+            f"{getattr(job, 'feed_rate_mmpm', '—')} mm/min" if job else
+            "  No active job — feed/RPM from last job not cached."
+        )
+        return {"intent": "query_feed_rpm", "result": "\n".join(lines), "raw": {}}
+
+    def _do_query_material(self, p: dict) -> dict:
+        job = self._agent.current_job
+        if job and getattr(job, 'material', None):
+            import config as _cfg
+            mat  = job.material
+            info = _cfg.MATERIAL_TABLE.get(mat, {})
+            sfm  = info[0] if info else "—"
+            kc   = info[1] if info else "—"
+            result = (f"Material — {self._agent.machine_id}:\n"
+                      f"  Material  : {mat}\n"
+                      f"  SFM range : {sfm}\n"
+                      f"  Kc (MPa)  : {kc}")
+        else:
+            result = f"Material — {self._agent.machine_id}:  no active job."
+        return {"intent": "query_material", "result": result, "raw": {}}
+
+    def _do_query_program(self, p: dict) -> dict:
+        job = self._agent.current_job
+        lines = [f"Program — {self._agent.machine_id}:"]
+        if job:
+            lines += [
+                f"  Job ID    : {job.job_id}",
+                f"  Seed      : {getattr(job, 'seed', '—')}",
+                f"  Lines     : {len(job.gcode_lines)}",
+                f"  Section   : {self._agent.current_section or '—'}",
+                f"  Done      : {list(self._agent.completed_sections)}",
+            ]
+        else:
+            lines.append("  No program loaded.")
+        return {"intent": "query_program", "result": "\n".join(lines), "raw": {}}
+
+    def _do_query_power(self, p: dict) -> dict:
+        import config as _cfg
+        job = self._agent.current_job
+        lines = [f"Power — {self._agent.machine_id}:"]
+        if job:
+            lines += [
+                f"  Machine limit   : {_cfg.MACHINE_POWER_LIMIT_KW:.1f} kW",
+                f"  (Real-time draw requires connected simulator mode)",
+            ]
+        else:
+            lines.append("  No active job.")
+        return {"intent": "query_power", "result": "\n".join(lines), "raw": {}}
+
+    def _do_query_execution_history(self, p: dict) -> dict:
+        n = int(p.get("n", 5))
+        hist = list(self._agent._error_history)[-n:]
+        lines = [f"Error/event history — {self._agent.machine_id} (last {n}):"]
+        if hist:
+            for ev in hist:
+                lines.append(
+                    f"  [{ev.tick:>6}] {ev.description[:60]}  "
+                    f"→ {ev.factory_response or 'pending'}"
+                )
+        else:
+            lines.append("  No history.")
+        return {"intent": "query_execution_history", "result": "\n".join(lines), "raw": hist}
+
+    def _do_query_error_log(self, p: dict) -> dict:
+        return self._do_query_execution_history(p)
+
+    def _do_unknown(self, p: dict) -> dict:
+        return {"intent": "unknown", "result": "Intent not recognised or not executable.", "raw": {}}
