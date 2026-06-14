@@ -421,10 +421,13 @@ import re as _re
 _TOOL_ID_RE = _re.compile(r'\bT(\d{1,2})\b', _re.IGNORECASE)
 
 _ACTION_SIGNALS: list[str] = [
-    "abort", "stop", "emergency", "broken", "break", "fail",
-    "chatter", "vibration", "overload", "dimension", "rework",
+    "abort", "stop", "emergency",
+    "broken", "break", "broke", "snapped", "shattered", "fail",
+    "chatter", "vibration", "resonance",
+    "overload", "dimension", "rework",
     "change tool", "reduce feed", "increase", "recalculate",
     "problem", "issue", "wrong", "error", "fault",
+    "not cutting", "poor finish", "wear", "worn",
 ]
 
 
@@ -720,3 +723,328 @@ class IntentExecutor:
 
     def _do_unknown(self, p: dict) -> dict:
         return {"intent": "unknown", "result": "Intent not recognised or not executable.", "raw": {}}
+
+
+# ── Deterministic action classifier ──────────────────────────────────────────
+# Known action types and their keyword triggers.
+# Checked in order; first match wins.
+
+_ACTION_PATTERNS: list[tuple[str, list[str]]] = [
+    # Tool completely broken / snapped
+    ("tool_broken", [
+        "broken", "snapped", "shattered", "catastrophic",
+        "tool broke", "broke mid", "no replacement",
+        "insert broken", "insert snapped",
+    ]),
+    # Tool issue / suspected wear / poor cutting (but not confirmed broken)
+    ("tool_issue", [
+        "issue with t", "problem with t", "t is worn", "t not cutting",
+        "t is not cutting", "poor cutting", "bad finish on", "tool issue",
+        "t not working", "suspected wear",
+        "not cutting well", "not cutting", "worn out",
+        "cutting poorly", "poor surface", "finish is poor",
+    ]),
+    # Chatter / vibration
+    ("chatter", [
+        "chatter", "vibration", "resonance", "squealing",
+        "ringing", "harmonics", "tool bounce",
+    ]),
+    # Feed / spindle overload
+    ("reduce_feed", [
+        "overload", "spindle overload", "reduce feed", "too high feed",
+        "feed too high", "reduce feedrate", "feedrate too high",
+        "spindle load", "cutting force", "power exceeded",
+    ]),
+    # Abort / emergency stop requested explicitly
+    ("abort", [
+        "abort", "stop the machine", "halt machine",
+        "emergency stop", "e-stop", "estop",
+    ]),
+]
+
+
+def classify_action(text: str) -> tuple[str, dict]:
+    """
+    Classify an operator action message into one of the known deterministic
+    action types.  Returns (action_type, parameters).
+
+    action_type is one of:
+      "tool_broken"   — broken insert; find replacement or nearest-diameter
+      "tool_issue"    — suspected issue with a specific tool; same resolution path
+      "chatter"       — reduce feed 10%, optionally change RPM
+      "reduce_feed"   — reduce feed 10% (overload / high cutting force)
+      "abort"         — retract Z-safe, stop spindle, go home
+      "unknown"       — not a recognised deterministic action
+
+    parameters dict may contain:
+      tool_id   — e.g. "T3" if a specific tool was named
+      face      — face/feature name if mentioned ("Face 2")
+    """
+    lower = text.lower()
+    params: dict = {}
+
+    # Extract tool_id if present
+    m = _TOOL_ID_RE.search(text)
+    if m:
+        params["tool_id"] = f"T{m.group(1)}"
+
+    # Extract face / feature name
+    face_m = _re.search(r'\bface\s*(\d+)\b', lower)
+    if face_m:
+        params["face"] = f"Face {face_m.group(1)}"
+
+    for action_type, keywords in _ACTION_PATTERNS:
+        for kw in keywords:
+            if kw in lower:
+                return (action_type, params)
+
+    return ("unknown", params)
+
+
+# ── Deterministic action executor ─────────────────────────────────────────────
+
+class ActionExecutor:
+    """
+    Execute deterministic actions directly — no LLM call required.
+
+    Each handler:
+      1. Calls agent.inject_error() to set the active_error state.
+      2. Executes the action (tool swap, feed reduction, abort, etc.).
+      3. Calls agent.handle_factory_response() to clear the error.
+      4. Returns a list of chat lines to display.
+
+    The app reference is optional.  When provided, _trigger_replan() is
+    called after any toolpath-invalidating change.
+    """
+
+    Z_SAFE_MM = 50.0   # retract height for abort / tool change
+
+    def __init__(self, agent, factory_agent, app=None):
+        self._agent = agent
+        self._fa    = factory_agent
+        self._app   = app
+        self._msim  = None      # injected by caller if available
+
+    def execute(self, action_type: str, parameters: dict) -> list[str]:
+        """Returns list of (speaker, text) tuples for the chat log."""
+        handler = getattr(self, f"_do_{action_type}", self._do_unknown)
+        return handler(parameters)
+
+    # ── helpers ───────────────────────────────────────────────────────────────
+
+    def _tick(self) -> int:
+        return getattr(self._fa.scheduler, "tick", 0)
+
+    def _inject(self, description: str) -> None:
+        """Set active_error so handle_factory_response() will fire."""
+        self._agent.inject_error(description)
+
+    def _resolve(self, action: str, **kwargs) -> None:
+        self._agent.handle_factory_response({"action": action, **kwargs})
+
+    def _replan(self) -> str:
+        """Trigger toolpath replan if app is available; return status line."""
+        if self._app is not None:
+            self._app._trigger_replan(self._agent.machine_id)
+            return "Toolpath replan queued — remaining features will be re-CAMed."
+        return "Replan needed — call _trigger_replan() manually."
+
+    def _try_replace_tool(self, tool_id: str) -> list[str]:
+        """
+        Try to replace a specific tool.
+        Returns list of chat lines describing what happened.
+        Steps:
+          1. Exact match from inventory.
+          2. Nearest-diameter substitute.
+          3. Remove from crib — run on remaining tools.
+        """
+        lines: list[str] = []
+        worn = self._agent.tool_crib.get(tool_id)
+        if worn is None:
+            lines.append(("factory",
+                f"Tool {tool_id} not found in {self._agent.machine_id} crib."))
+            return lines
+
+        cmd = self._fa.install_replacement_tool(
+            self._agent, worn, self._tick(), urgency="stop")
+
+        if cmd is None:
+            lines.append(("factory",
+                f"⚠ {tool_id}: install_replacement_tool returned None."))
+            return lines
+
+        p = cmd.payload
+        if cmd.action == "tool_removed_no_stock":
+            dia = p.get("diameter_mm", 0)
+            lines += [
+                ("factory",
+                 f"🚫 No stock for {tool_id} (Ø{dia:.0f}mm) — tool removed from crib."),
+                ("factory",
+                 f"Machine will continue on remaining tools."),
+            ]
+            lines.append(("factory", self._replan()))
+        elif cmd.action == "replace_tool":
+            new_id  = p.get("new_tool_id", "?")
+            new_dia = p.get("diameter_mm", 0)
+            if p.get("substitute"):
+                lines += [
+                    ("factory",
+                     f"⚠ No exact {tool_id} stock — installing nearest substitute "
+                     f"{new_id} (Ø{new_dia:.0f}mm)."),
+                    ("factory",
+                     f"Different diameter: toolpath must be recomputed."),
+                ]
+                lines.append(("factory", self._replan()))
+            else:
+                lines.append(("factory",
+                    f"✅ {tool_id} → {new_id} (Ø{new_dia:.0f}mm) installed from inventory."))
+                # Same diameter — no replan needed unless the job references the tool explicitly
+                lines.append(("machine",
+                    f"Tool {new_id} loaded.  Resuming program from current section."))
+        return lines
+
+    # ── action handlers ───────────────────────────────────────────────────────
+
+    def _do_tool_broken(self, p: dict) -> list[str]:
+        tool_id = p.get("tool_id")
+        mid     = self._agent.machine_id
+        lines: list[str] = []
+
+        self._inject(f"Tool broken: {tool_id or 'unknown'}")
+
+        # If no specific tool named, check what's at STOP_PCT in the crib
+        if not tool_id:
+            at_stop = self._agent.tool_crib.tools_at_stop()
+            if at_stop:
+                tool_id = at_stop[0].tool_id
+                lines.append(("factory",
+                    f"🔴 No tool ID specified — using first STOP-threshold tool: {tool_id}"))
+            else:
+                # Use currently active tool if job is running
+                job = self._agent.current_job
+                if job:
+                    active = self._agent.tool_crib.select_for_face(200.0)
+                    tool_id = active.tool_id if active else None
+
+        if not tool_id:
+            lines.append(("factory", "⚠ Cannot identify broken tool — please specify T1…T10."))
+            self._resolve("continue")
+            return lines
+
+        lines.append(("machine",
+            f"🔧 {mid}: {tool_id} reported broken.  Spindle retracted to Z{self.Z_SAFE_MM:.0f}."))
+        lines.append(("factory",
+            f"Requesting replacement for {tool_id} from factory inventory…"))
+
+        # Does the remaining job even USE this tool?
+        remaining_uses_tool = self._remaining_job_uses_tool(tool_id)
+        replace_lines = self._try_replace_tool(tool_id)
+        lines.extend(replace_lines)
+
+        if not remaining_uses_tool:
+            lines.append(("factory",
+                f"ℹ Remaining toolpath does not require {tool_id} — "
+                f"continuing without replan."))
+            self._resolve("continue")
+        else:
+            self._resolve("continue")
+
+        lines.append(("machine",
+            f"G0 Z{self.Z_SAFE_MM:.0f}  ; retract to safe height\n"
+            f"M5               ; spindle stop\n"
+            f"T{tool_id[1:]} M6       ; tool change block (operator confirms)\n"
+            f"M3 S[rpm]        ; restart spindle"))
+        return lines
+
+    def _do_tool_issue(self, p: dict) -> list[str]:
+        """Suspected issue with a tool — same resolution path as broken."""
+        tool_id = p.get("tool_id")
+        lines: list[str] = [
+            ("factory",
+             f"⚠ Suspected issue with {tool_id or 'tool'} — "
+             f"treating as worn/broken; seeking replacement."),
+        ]
+        lines.extend(self._do_tool_broken(p))
+        return lines
+
+    def _do_chatter(self, p: dict) -> list[str]:
+        """Chatter / vibration — reduce feed by 10%, suggest RPM shift."""
+        mid     = self._agent.machine_id
+        face    = p.get("face", "current feature")
+        self._inject(f"Chatter detected on {face}")
+
+        job = self._agent.current_job
+        current_feed = (job.estimated_time_s / 60.0 * 800 if job else 1000)  # rough estimate
+        new_feed     = round(current_feed * 0.90)
+        new_pct      = 90.0
+
+        self._resolve("reduce_feed", feed_override_pct=new_pct)
+
+        return [
+            ("machine",
+             f"⚠ {mid}: chatter detected on {face}."),
+            ("factory",
+             f"Action: reduce feed rate by 10%  →  override = {new_pct:.0f}%"),
+            ("factory",
+             f"Additionally: try shifting RPM ±10–15% to move away from resonance frequency.\n"
+             f"  G-code: F{new_feed}  ; new feed rate\n"
+             f"           S[rpm ± 10%] ; RPM shift if chatter persists"),
+            ("machine",
+             f"Feed override set to {new_pct:.0f}%.  Monitoring spindle load."),
+        ]
+
+    def _do_reduce_feed(self, p: dict) -> list[str]:
+        """Spindle overload / high cutting force — reduce feed by 10%."""
+        mid    = self._agent.machine_id
+        new_pct = 90.0
+        self._inject("Feed / spindle overload")
+        self._resolve("reduce_feed", feed_override_pct=new_pct)
+
+        return [
+            ("machine",
+             f"⚠ {mid}: overload detected."),
+            ("factory",
+             f"Action: feed rate override → {new_pct:.0f}%  (−10%).\n"
+             f"  If spindle load remains >90% after one full pass, reduce by a further 10%."),
+            ("machine",
+             f"Feed override applied.  Continuing machining."),
+        ]
+
+    def _do_abort(self, p: dict) -> list[str]:
+        """Explicit abort — retract Z, stop spindle, go home."""
+        mid = self._agent.machine_id
+        self._inject("Operator requested abort")
+        self._resolve("abort")
+
+        return [
+            ("machine",
+             f"🛑 {mid}: abort received."),
+            ("factory",
+             f"Executing safe abort sequence:\n"
+             f"  G0 Z{self.Z_SAFE_MM:.0f}    ; retract to Z-safe\n"
+             f"  M5           ; spindle stop\n"
+             f"  M9           ; coolant off\n"
+             f"  G28 G91 Z0   ; return Z to home\n"
+             f"  G28 G90 X0 Y0 ; return XY to home\n"
+             f"  M30          ; program end"),
+            ("machine",
+             f"Machine stopped.  Part moved to rework queue.  "
+             f"Reset required before next job."),
+        ]
+
+    def _do_unknown(self, p: dict) -> list[str]:
+        return [("factory", "Action not recognised — routing to full diagnosis pipeline.")]
+
+    # ── helpers ───────────────────────────────────────────────────────────────
+
+    def _remaining_job_uses_tool(self, tool_id: str) -> bool:
+        """
+        Check whether the tool is referenced in the remaining (unmachined)
+        G-code lines.  Returns True if uncertain (safe default).
+        """
+        if self._msim is None or not hasattr(self._msim, 'gcode_lines'):
+            return True   # unknown → assume yes
+        cursor = getattr(self._msim, 'gcode_cursor', 0)
+        remaining = self._msim.gcode_lines[cursor:]
+        tool_ref  = f"T{tool_id[1:]}"   # "T3" → "T3"
+        return any(tool_ref in line for line in remaining)

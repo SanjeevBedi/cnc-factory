@@ -389,26 +389,40 @@ class AgentConversationWindow(tk.Toplevel):
 
         # ── Classify: query vs disturbance action ─────────────────────────
         import threading
-        from agent_intents import classify_message, IntentExecutor, extract_parameters
+        from agent_intents import (
+            classify_message, extract_parameters,
+            classify_action, ActionExecutor,
+        )
 
         msg_type, intent_id = classify_message(txt)
 
         if msg_type == "query":
-            # Direct answer path — no error injection, no LLM pipeline
+            # ── Path A: data query — direct answer, no LLM ──────────────
             params = extract_parameters(txt, intent_id)
             threading.Thread(
                 target=self._answer_query,
                 args=(agent, intent_id, params),
                 daemon=True,
             ).start()
+
         else:
-            # Action / disturbance path — full diagnosis pipeline
-            agent.inject_error(txt)
-            threading.Thread(
-                target=self._app._diagnose_disturbance,
-                args=(agent, None, {}, self),
-                daemon=True,
-            ).start()
+            action_type, action_params = classify_action(txt)
+
+            if action_type != "unknown":
+                # ── Path B: known deterministic action ──────────────────
+                threading.Thread(
+                    target=self._execute_action,
+                    args=(agent, action_type, action_params),
+                    daemon=True,
+                ).start()
+            else:
+                # ── Path C: complex / ambiguous → full LLM pipeline ─────
+                agent.inject_error(txt)
+                threading.Thread(
+                    target=self._app._diagnose_disturbance,
+                    args=(agent, None, {}, self),
+                    daemon=True,
+                ).start()
 
     def _answer_query(self, agent, intent_id: str, parameters: dict) -> None:
         """Execute a query intent and stream the result into the chat log."""
@@ -435,6 +449,27 @@ class AgentConversationWindow(tk.Toplevel):
         intent_label = INTENT_MAP[intent_id].label if intent_id in INTENT_MAP else intent_id
         post("factory", f"ℹ {intent_label}")
         post("machine", result["result"])
+
+    def _execute_action(self, agent, action_type: str, parameters: dict) -> None:
+        """Execute a deterministic action and post each chat line to the log."""
+        from agent_intents import ActionExecutor, _ACTION_PATTERNS
+
+        executor = ActionExecutor(agent, self._app.fa, app=self._app)
+        msim = self._app._msim.get(agent.machine_id)
+        if msim is not None:
+            executor._msim = msim
+
+        # Show what action was detected
+        label = next(
+            (atype for atype, _ in _ACTION_PATTERNS if atype == action_type),
+            action_type
+        ).replace("_", " ").title()
+        self._app.post_chat(self._mid, "factory",
+                            f"────  {label}  ────")
+
+        chat_lines = executor.execute(action_type, parameters)
+        for speaker, text in chat_lines:
+            self._app.post_chat(self._mid, speaker, text)
 
     def _export(self) -> None:
         path = filedialog.asksaveasfilename(
