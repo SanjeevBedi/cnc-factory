@@ -480,3 +480,320 @@ class AgentConversationWindow(tk.Toplevel):
         if path:
             with open(path, "w", encoding="utf-8") as f:
                 f.write(self.export_log())
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  FACTORY CONVERSATION WINDOW
+#  Mirrors AgentConversationWindow but operates at factory level.
+#  Opened via factory_gui.py's "Factory Chat" button.
+# ══════════════════════════════════════════════════════════════════════════════
+
+FACTORY_ACCENT = "#8b5cf6"   # violet — distinct from all four machine colours
+
+
+class FactoryConversationWindow(tk.Toplevel):
+    """
+    Factory-level conversation window.
+
+    Routing (same three-path architecture as AgentConversationWindow):
+      Path A  →  factory query    →  FactoryIntentExecutor  (direct answer)
+      Path B  →  factory action   →  FactoryActionExecutor  (deterministic)
+      Path C  →  LLM advisory     →  FactoryActionExecutor._do_factory_ai_advice()
+
+    The "factory" speaker ID in the chat always refers to the factory agent,
+    not an individual machine.
+    """
+
+    _FACTORY_MID = "factory"   # pseudo machine_id for post_chat routing
+
+    def __init__(self, parent, factory_gui):
+        super().__init__(parent)
+        self._app     = factory_gui
+        self._streams: dict[str, str] = {}
+        self._spin_idx: int = 0
+        self._thinking: bool = False
+
+        self.title("🏭  Factory  ↔  Fleet Overview  ↔  OpenAI")
+        self.configure(bg=BG)
+        self.geometry("860x660")
+        self.minsize(640, 480)
+        self.resizable(True, True)
+
+        self._build_ui()
+        self.after(200, self._tick_spinner)
+        self.protocol("WM_DELETE_WINDOW", self.withdraw)
+
+    # ── UI construction ───────────────────────────────────────────────────────
+
+    def _build_ui(self) -> None:
+        accent = FACTORY_ACCENT
+
+        # title bar
+        hdr = tk.Frame(self, bg=accent, height=30)
+        hdr.pack(fill="x")
+        hdr.pack_propagate(False)
+        tk.Label(hdr,
+                 text="🏭  Factory  ↔  Fleet Overview  ↔  OpenAI",
+                 bg=accent, fg="white",
+                 font=("Helvetica", 10, "bold")).pack(side="left", padx=8)
+        tk.Button(hdr, text="Export log", bg=accent, fg="white",
+                  relief="flat", font=("Helvetica", 8),
+                  command=self._export).pack(side="right", padx=6)
+        tk.Button(hdr, text="Clear", bg=accent, fg="white",
+                  relief="flat", font=("Helvetica", 8),
+                  command=self.clear).pack(side="right", padx=2)
+
+        # KPI strip
+        kpi_frame = tk.Frame(self, bg=PNL, height=24)
+        kpi_frame.pack(fill="x")
+        kpi_frame.pack_propagate(False)
+        self._kpi_lbl = tk.Label(
+            kpi_frame, text="", bg=PNL, fg=DIM,
+            font=("Courier", 8), anchor="w"
+        )
+        self._kpi_lbl.pack(fill="x", padx=8)
+
+        # main pane
+        pane = tk.Frame(self, bg=BG)
+        pane.pack(fill="both", expand=True)
+        pane.rowconfigure(0, weight=1)
+        pane.columnconfigure(0, weight=1)
+
+        # conversation log
+        self._log = tk.Text(
+            pane, bg="#070d15", fg=FG,
+            font=("Courier", 10), wrap="word",
+            state="disabled", selectbackground=ENTRY,
+            padx=6, pady=4,
+        )
+        sb = ttk.Scrollbar(pane, command=self._log.yview)
+        self._log.configure(yscrollcommand=sb.set)
+        self._log.grid(row=0, column=0, sticky="nsew")
+        sb.grid(row=0, column=1, sticky="ns")
+        self._setup_tags()
+
+        # thinking bar
+        think_frame = tk.Frame(self, bg=PNL, height=22)
+        think_frame.pack(fill="x")
+        think_frame.pack_propagate(False)
+        self._think_lbl = tk.Label(
+            think_frame, text="", bg=PNL, fg=PURPLE,
+            font=("Courier", 9), anchor="w"
+        )
+        self._think_lbl.pack(fill="x", padx=8)
+
+        # operator input
+        inp = tk.Frame(self, bg=BG)
+        inp.pack(fill="x", padx=4, pady=4)
+        self._entry = tk.Entry(
+            inp, bg=ENTRY, fg=FG, insertbackground=FG,
+            font=("Courier", 10), relief="flat"
+        )
+        self._entry.pack(side="left", fill="x", expand=True, padx=(0, 4))
+        self._entry.bind("<Return>", self._send)
+        self._entry.insert(0, "Ask the factory agent…")
+        self._entry.bind("<FocusIn>",
+            lambda _: (self._entry.delete(0, "end")
+                       if self._entry.get().startswith("Ask") else None))
+        tk.Button(
+            inp, text="Send", bg=FACTORY_ACCENT, fg="white",
+            relief="flat", padx=10, command=self._send,
+        ).pack(side="right")
+
+        # Quick-access buttons for common queries
+        btn_frame = tk.Frame(self, bg=PNL)
+        btn_frame.pack(fill="x", padx=4, pady=(0, 4))
+        quick = [
+            ("Fleet status",      "factory status"),
+            ("Active machines",   "which machines are running?"),
+            ("Queue",             "what parts are in the queue?"),
+            ("Idle time",         "idle time for each machine"),
+            ("Tool history",      "tool usage history"),
+            ("AI Advice",         "advise me on factory performance"),
+        ]
+        for label, cmd_text in quick:
+            tk.Button(
+                btn_frame, text=label, bg=PNL, fg=ACCENT,
+                relief="flat", font=("Helvetica", 8),
+                command=lambda t=cmd_text: self._quick_send(t),
+            ).pack(side="left", padx=2, pady=2)
+
+    def _setup_tags(self) -> None:
+        t = self._log
+        t.tag_config("ts",        foreground=DIM,    font=("Courier", 8))
+        t.tag_config("machine",   foreground=ACCENT, font=("Courier", 10, "bold"))
+        t.tag_config("factory",   foreground=GREEN,  font=("Courier", 10, "bold"))
+        t.tag_config("openai",    foreground=PURPLE, font=("Courier", 10, "bold"))
+        t.tag_config("fallback",  foreground=TEAL,   font=("Courier", 10, "bold"))
+        t.tag_config("system",    foreground=DIM)
+        t.tag_config("operator",  foreground=ORANGE, font=("Courier", 10, "bold"))
+        t.tag_config("body",      foreground=FG)
+        t.tag_config("indent",    foreground=DIM, lmargin1=20, lmargin2=20)
+        t.tag_config("phase_sep", foreground="#30363d",
+                     font=("Courier", 8), spacing1=6, spacing3=4)
+        t.tag_config("stream",    foreground="#a0c0ff")
+
+    # ── Public interface ──────────────────────────────────────────────────────
+
+    def append(self, speaker_key: str, text: str) -> None:
+        style  = SPEAKER_STYLE.get(speaker_key, SPEAKER_STYLE["system"])
+        name, color, pad = style
+        name   = name.format(mid="Factory")
+        ts     = datetime.datetime.now().strftime("%H:%M:%S")
+        pfx    = " " * pad
+
+        self._write(f"{pfx}[{ts}] ", "ts")
+        self._write(f"{pfx}{name:<12s}  ", speaker_key)
+        lines  = text.split("\n")
+        self._write(lines[0] + "\n", "body")
+        for line in lines[1:]:
+            self._write("               " + " " * pad + line + "\n", "body")
+
+    def clear(self) -> None:
+        self._log.configure(state="normal")
+        self._log.delete("1.0", "end")
+        self._log.configure(state="disabled")
+
+    def open(self) -> None:
+        self.deiconify()
+        self.lift()
+        self.focus_set()
+        self._refresh_kpi()
+
+    def set_thinking(self, thinking: bool, who: str = "") -> None:
+        self._thinking = thinking
+        self._think_who = who if thinking else ""
+        if not thinking:
+            self._think_lbl.configure(text="")
+
+    def export_log(self) -> str:
+        return self._log.get("1.0", "end")
+
+    # ── Internals ─────────────────────────────────────────────────────────────
+
+    def _write(self, text: str, tag: str = "body") -> None:
+        self._log.configure(state="normal")
+        self._log.insert("end", text, tag)
+        self._log.see("end")
+        self._log.configure(state="disabled")
+
+    def _tick_spinner(self) -> None:
+        if self._thinking:
+            frame = _SPIN[self._spin_idx % len(_SPIN)]
+            self._think_lbl.configure(
+                text=f"  {frame}  {getattr(self, '_think_who', '')}  generating…")
+            self._spin_idx += 1
+        self.after(140, self._tick_spinner)
+
+    def _refresh_kpi(self) -> None:
+        """Update the KPI strip with live fleet data."""
+        try:
+            kpis = self._app.fa.get_production_kpis()
+            self._kpi_lbl.configure(
+                text=(
+                    f"  Machines: {kpis['machines_running']} run  "
+                    f"{kpis['machines_idle']} idle  "
+                    f"{kpis['machines_stopped']} stopped  │  "
+                    f"Jobs: {kpis['total_jobs_completed']} done  "
+                    f"{kpis['scheduler_queue_depth']} queued  "
+                    f"{kpis['rework_queue_depth']} rework  │  "
+                    f"Tool life avg: {kpis['avg_tool_life_pct']:.1f}%  │  "
+                    f"Policy: {self._app.fa.policy}"
+                )
+            )
+        except Exception:
+            pass
+        # refresh every 5 s
+        self.after(5000, self._refresh_kpi)
+
+    def _quick_send(self, text: str) -> None:
+        """Inject a pre-defined query as if the operator typed it."""
+        self._entry.delete(0, "end")
+        self._entry.insert(0, text)
+        self._send()
+
+    def _send(self, _=None) -> None:
+        txt = self._entry.get().strip()
+        if not txt or txt.startswith("Ask"):
+            return
+        self._entry.delete(0, "end")
+        self.append("operator", txt)
+
+        # ── Three-path routing ────────────────────────────────────────────
+        import threading
+        from factory_intents import (
+            classify_factory_message,
+            extract_factory_parameters,
+            classify_factory_action,
+        )
+
+        msg_type, intent_id = classify_factory_message(txt)
+
+        if msg_type == "query":
+            # Path A — direct data query
+            params = extract_factory_parameters(txt, intent_id)
+            threading.Thread(
+                target=self._answer_factory_query,
+                args=(intent_id, params),
+                daemon=True,
+            ).start()
+        else:
+            action_type, action_params = classify_factory_action(txt)
+            if action_type != "unknown":
+                # Path B — deterministic factory action (inc. AI advisory)
+                threading.Thread(
+                    target=self._execute_factory_action,
+                    args=(action_type, action_params),
+                    daemon=True,
+                ).start()
+            else:
+                # Path C — unrecognised; fall through to AI advice
+                action_params["question"] = txt
+                threading.Thread(
+                    target=self._execute_factory_action,
+                    args=("factory_ai_advice", action_params),
+                    daemon=True,
+                ).start()
+
+    def _answer_factory_query(self, intent_id: str, parameters: dict) -> None:
+        from factory_intents import FactoryIntentExecutor, FACTORY_INTENT_MAP
+
+        executor = FactoryIntentExecutor(self._app.fa, app=self._app)
+        # Inject all _MachSim references so live G-code state is available
+        for mid, msim in self._app._msim.items():
+            executor._msim[mid] = msim
+
+        result = executor.execute(intent_id, parameters)
+        label  = (FACTORY_INTENT_MAP[intent_id].label
+                  if intent_id in FACTORY_INTENT_MAP else intent_id)
+
+        self._app.post_factory_chat("factory", f"ℹ {label}")
+        self._app.post_factory_chat("factory", result["result"])
+
+    def _execute_factory_action(self, action_type: str, parameters: dict) -> None:
+        from factory_intents import FactoryActionExecutor
+
+        self.set_thinking(True, "Factory AI")
+        try:
+            executor = FactoryActionExecutor(self._app.fa, app=self._app)
+            for mid, msim in self._app._msim.items():
+                executor._msim[mid] = msim
+
+            label = action_type.replace("_", " ").title()
+            self._app.post_factory_chat("factory", f"────  {label}  ────")
+
+            chat_lines = executor.execute(action_type, parameters)
+            for speaker, text in chat_lines:
+                self._app.post_factory_chat(speaker, text)
+        finally:
+            self.set_thinking(False)
+
+    def _export(self) -> None:
+        path = filedialog.asksaveasfilename(
+            defaultextension=".txt",
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+            initialfile=f"factory_conversation_{time.strftime('%Y%m%d_%H%M%S')}.txt",
+        )
+        if path:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(self.export_log())

@@ -70,7 +70,7 @@ import config
 from cnc_agent import CncAgent, ToolRecord, build_default_crib
 from factory_agent import FactoryAgent, FactoryCommand, build_factory_agent
 from scheduler import make_job, job_from_gcode
-from agent_dialog import AgentConversationWindow, Phase
+from agent_dialog import AgentConversationWindow, FactoryConversationWindow, Phase
 from pipeline_monitor import PipelineMonitorWindow
 from disturbance_engine import (
     REGISTRY, BY_CATEGORY, Category, DisturbanceSpec, GUIField,
@@ -965,6 +965,9 @@ class FactoryGUI(tk.Tk):
         # Parts queue display window (single window, opened on demand)
         self._queue_win = None
 
+        # Factory conversation window (singleton)
+        self._factory_cw: "Optional[FactoryConversationWindow]" = None
+
         # Track all seeds ever submitted this session (for queue window)
         self._all_jobs = []   # {seed, mid, status, lines, job_id}
 
@@ -1069,6 +1072,12 @@ class FactoryGUI(tk.Tk):
                   relief="flat", font=("Helvetica", 9, "bold"), padx=8,
                   activebackground="#bdbdbd", activeforeground="black",
                   command=self._open_queue_window).pack(side="right", padx=6)
+
+        tk.Button(top, text="🏭 Factory Chat",
+                  bg="#3b1f6e", fg="#c4b5fd",
+                  relief="flat", font=("Helvetica", 9, "bold"), padx=8,
+                  activebackground="#4c2889", activeforeground="#ddd6fe",
+                  command=self._open_factory_chat).pack(side="right", padx=6)
 
         # ── main area ─────────────────────────────────────────────────────
         main = tk.Frame(self, bg=BG)
@@ -1875,6 +1884,12 @@ class FactoryGUI(tk.Tk):
         finally:
             self._cam_in_flight -= 1
 
+    def _open_factory_chat(self) -> None:
+        """Open (or bring to front) the factory-level conversation window."""
+        if self._factory_cw is None or not self._factory_cw.winfo_exists():
+            self._factory_cw = FactoryConversationWindow(self, self)
+        self._factory_cw.open()
+
     def _open_queue_window(self) -> None:
         """Open (or raise) the single parts-queue display window."""
         if self._queue_win and self._queue_win.winfo_exists():
@@ -1943,6 +1958,11 @@ class FactoryGUI(tk.Tk):
         """Thread-safe helper: post a chat_append event to the GUI poll loop.
         Called by agent_dialog._answer_query to avoid a circular import."""
         self._eq.put(GuiEvent("chat_append", mid,
+                              {"speaker": speaker, "text": text}))
+
+    def post_factory_chat(self, speaker: str, text: str) -> None:
+        """Thread-safe helper: append a message to the factory chat window."""
+        self._eq.put(GuiEvent("factory_chat_append", "factory",
                               {"speaker": speaker, "text": text}))
 
     def inject_error(self, machine_id: str, description: str) -> None:
@@ -2397,6 +2417,11 @@ class FactoryGUI(tk.Tk):
             if panel:
                 panel.append_chat(
                     ev.data["speaker"], ev.data["text"], ev.data.get("tag","system"))
+
+        elif kind == "factory_chat_append":
+            # Route to FactoryConversationWindow if it exists and is open
+            if self._factory_cw and self._factory_cw.winfo_exists():
+                self._factory_cw.append(ev.data["speaker"], ev.data["text"])
 
         elif kind == "manual_error":
             pass  # handled by ChatWindow._send already

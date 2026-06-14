@@ -23,6 +23,7 @@ import json
 import os
 import uuid
 from agent_intents import build_system_context, build_suggestions_block
+from factory_intents import FactoryLedger
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Callable, Optional
@@ -161,6 +162,9 @@ class FactoryAgent:
         self.total_tools_replaced   = 0
         self.total_jobs_completed   = 0
 
+        # ── Factory Ledger — persistent record of all events ──────────────
+        self.ledger: FactoryLedger = FactoryLedger()
+
     # ── Tick ------------------------------------------------------------------
 
     def tick(self) -> FactoryTickResult:
@@ -183,6 +187,17 @@ class FactoryAgent:
         )
         self.total_jobs_completed += len(sched_result.jobs_finished)
 
+        # ── Ledger: record newly started and completed jobs ────────────────
+        for job_id in sched_result.jobs_started:
+            self.ledger.record_started(job_id, tick_num)
+        for job_id in sched_result.jobs_finished:
+            cj = next((j for j in self.scheduler.completed_jobs
+                       if j.job_id == job_id), None)
+            self.ledger.record_finished(
+                job_id, tick_num,
+                actual_time_s=(cj.estimated_time_s if cj else 0.0),
+            )
+
         # ── Mirror scheduler → agent queues ─────────────────────────────
         # The scheduler assigns jobs to scheduler.Machine objects.
         # The GUI uses agent.part_queue to read gcode_lines for animation.
@@ -192,6 +207,9 @@ class FactoryAgent:
         for agent in self.agents:
             sm = sched_machines.get(agent.machine_id)
             if sm is None or sm.current_job is None:
+                if agent.status == "idle":
+                    self.ledger.machine_went_idle(
+                        agent.machine_id, tick_num, reason="no_jobs")
                 continue
             job = sm.current_job
             # Only enqueue if this job isn't already in the agent's queue
@@ -201,6 +219,9 @@ class FactoryAgent:
             if not already_queued and agent.current_job is None:
                 agent.part_queue.append(job)
                 agent.status = "running"   # mark as active for display
+                self.ledger.machine_became_active(agent.machine_id, tick_num)
+                self.ledger.record_allocated(
+                    job.job_id, agent.machine_id, self.policy, tick_num)
 
         # ── Per-agent error protocol (skip execute_job — GUI drives G-code)
         for agent in self.agents:
@@ -217,6 +238,27 @@ class FactoryAgent:
         ftr.commands_sent.extend(rcmds)
         ftr.tools_replaced = len(rcmds)
         self.total_tools_replaced += len(rcmds)
+
+        # ── Ledger: record tool events from this tick ──────────────────────
+        for cmd in rcmds:
+            payload  = cmd.payload
+            evt_type = (
+                "warn"     if cmd.action == "tool_worn_warn"     else
+                "stop"     if cmd.action == "tool_worn_stop"     else
+                "replace"  if cmd.action == "replace_tool"       else
+                "no_stock" if cmd.action == "tool_removed_no_stock" else
+                cmd.action
+            )
+            self.ledger.record_tool_event(
+                tick_num,
+                cmd.target_machine_id,
+                payload.get("tool_id", "?"),
+                evt_type,
+                life_pct    = payload.get("life_pct", 0.0),
+                diameter_mm = payload.get("diameter_mm", 0.0),
+                message     = cmd.action,
+                substitute  = payload.get("substitute", False),
+            )
 
         ftr.jobs_in_rework = len(self.rework_queue)
         self.command_log.extend(ftr.commands_sent)
@@ -890,6 +932,13 @@ class FactoryAgent:
         # ── Stage: scheduler ─────────────────────────────────────────────
         _cb("schedule", "Submitting G-code job to scheduler queue…")
         self.scheduler.submit(job)    # sets job.status = "queued"
+        # ── Ledger: record queued event ────────────────────────────────────
+        self.ledger.record_queued(
+            job.job_id, seed,
+            job.estimated_time_s,
+            getattr(job, "material", "unknown"),
+            self.scheduler.tick,
+        )
         _cb("schedule",
             f"Job {job.job_id[:8]}…  queued  "
             f"(depth = {len(self.scheduler.job_queue)})")
