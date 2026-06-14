@@ -477,6 +477,7 @@ _ACTION_SIGNALS: list[str] = [
     "overload", "dimension", "rework",
     "change tool", "reduce feed", "increase", "recalculate",
     "problem", "issue", "wrong", "error", "fault",
+    "incorrect material", "material mismatch", "wrong material",
     "not cutting", "poor finish", "wear", "worn",
 ]
 
@@ -489,35 +490,118 @@ def classify_message(text: str) -> tuple[str, Optional[str]]:
 
     Priority:
       1. Action-signal words short-circuit to ("action", None).
-      2. Query keywords → first matching category.
-      3. Bare tool-ID mention (T1…T10) without action signals → tool detail query.
-      4. Intent_id word in text → use that intent if it is a query category.
-      5. Default: ("action", None).
+      2. Phrase scan  — exact keyword phrases from _QUERY_KEYWORDS.
+      3. Token scan   — presence of semantic word sets regardless of order.
+      4. Bare tool-ID (T1…T10) with no action signals → tool detail query.
+      5. Intent_id word in text.
+      6. Default: ("action", None).
     """
     lower = text.lower()
+    # normalise "gcode" / "g code" → "g-code" for uniform matching
+    lower = lower.replace("gcode", "g-code").replace("g code", "g-code")
 
     # 1. Action signals override everything
     for sig in _ACTION_SIGNALS:
         if sig in lower:
             return ("action", None)
 
-    # 2. Keyword scan (order of _QUERY_KEYWORDS dict matters)
+    # 2. Phrase scan
     for intent_id, keywords in _QUERY_KEYWORDS.items():
         for kw in keywords:
             if kw in lower:
                 return ("query", intent_id)
 
-    # 3. Bare tool-ID with no other context → treat as detail query
+    # 3. Token-combination fallback — word-order independent
+    result = _token_classify(lower)
+    if result:
+        return ("query", result)
+
+    # 4. Bare tool-ID
     if _TOOL_ID_RE.search(text):
         return ("query", "query_tool_detail")
 
-    # 4. Exact intent_id word
+    # 5. Exact intent_id word
     for intent_id in INTENT_MAP:
         if intent_id.replace("_", " ") in lower or intent_id in lower:
             if INTENT_MAP[intent_id].category == "query":
                 return ("query", intent_id)
 
     return ("action", None)
+
+
+def _token_classify(lower: str) -> Optional[str]:
+    """
+    Word-token based classification — fires when phrase matching fails.
+    Checks for the co-presence of semantic word groups regardless of order.
+    Returns an intent_id or None.
+    """
+    # helpers
+    def has(words):
+        return any(w in lower for w in words)
+
+    GCODE     = ["g-code", "gcode"]
+    QUESTION  = ["what", "which", "show", "tell", "give", "list",
+                 "display", "print", "dump", "is it", "are you"]
+    PART_HINT = ["part", "job", "seed", "machining", "cutting",
+                 "working on", "being made", "being cut", "being machined"]
+    HIST_HINT = ["last", "previous", "ran", "history", "did", "just ran",
+                 "executed", "already ran", "recently"]
+    NEXT_HINT = ["next", "upcoming", "will", "going to", "about to",
+                 "future", "after this", "execute next", "run next",
+                 "following", "then execute"]
+    FULL_HINT = ["all", "full", "complete", "entire", "whole",
+                 "listing", "list", "print", "dump", "give me", "show me all",
+                 "show all"]
+    CUR_HINT  = ["running", "executing", "current", "now", "active",
+                 "right now", "at the moment", "currently", "is it",
+                 "are you running", "is running", "is executing",
+                 "you running", "you executing"]
+    STAT_HINT = ["status", "state", "what is the machine",
+                 "machine doing", "happening"]
+    TOOL_HINT = ["tool", "insert", "crib", "wear", "life",
+                 "diameter", "radius", "shank"]
+    QUEUE_HINT= ["queue", "queued", "backlog", "waiting", "jobs"]
+
+    # G-code queries
+    if has(GCODE):
+        if has(HIST_HINT):
+            return "query_gcode_history"
+        if has(NEXT_HINT):
+            return "query_gcode_upcoming"
+        if has(FULL_HINT):
+            return "query_gcode_full"
+        if has(CUR_HINT):
+            # explicitly "running / executing / current / now" → current line
+            return "query_gcode_current"
+        # question word alone (show / what / give / list) with no
+        # qualifier → full listing
+        return "query_gcode_full"
+
+    # Part / job queries
+    if has(PART_HINT) and has(QUESTION + CUR_HINT):
+        return "query_current_part"
+
+    # "what will execute next" / "what executes next" — no g-code word but clear intent
+    if has(["execute next", "executing next", "run next", "runs next"]):
+        return "query_gcode_upcoming"
+
+    # Generic "what is executing / running" without g-code
+    if has(["executing", "running", "being executed"]) and has(QUESTION):
+        return "query_gcode_current"
+
+    # Machine status
+    if has(STAT_HINT) and has(QUESTION):
+        return "query_status"
+
+    # Tool / crib (broad catch)
+    if has(TOOL_HINT) and has(QUESTION):
+        return "query_tool_crib"
+
+    # Queue
+    if has(QUEUE_HINT) and has(QUESTION):
+        return "query_queue"
+
+    return None
 
 
 def extract_parameters(text: str, intent_id: str) -> dict:
@@ -937,6 +1021,11 @@ _ACTION_PATTERNS: list[tuple[str, list[str]]] = [
         "abort", "stop the machine", "halt machine",
         "emergency stop", "e-stop", "estop",
     ]),
+    ("wrong_material", [
+        "wrong material", "incorrect material", "material mismatch",
+        "wrong alloy", "wrong grade", "wrong stock",
+        "material is wrong", "loaded wrong material",
+    ]),
 ]
 
 
@@ -1122,8 +1211,7 @@ class ActionExecutor:
             lines.append(("factory",
                 f"ℹ Remaining toolpath does not require {tool_id} — "
                 f"continuing without replan."))
-            self._resolve("continue")
-        else:
+        if self._agent.active_error is not None:
             self._resolve("continue")
 
         lines.append(("machine",
@@ -1150,48 +1238,63 @@ class ActionExecutor:
         face    = p.get("face", "current feature")
         self._inject(f"Chatter detected on {face}")
 
-        job = self._agent.current_job
-        current_feed = (job.estimated_time_s / 60.0 * 800 if job else 1000)  # rough estimate
+        job          = self._agent.current_job
+        current_feed = getattr(job, "feed_rate_mmpm", 1000) if job else 1000
         new_feed     = round(current_feed * 0.90)
         new_pct      = 90.0
 
-        self._resolve("reduce_feed", feed_override_pct=new_pct)
+        if self._agent.active_error is not None:
+            self._resolve("reduce_feed", feed_override_pct=new_pct)
 
         return [
             ("machine",
              f"⚠ {mid}: chatter detected on {face}."),
             ("factory",
-             f"Action: reduce feed rate by 10%  →  override = {new_pct:.0f}%"),
+             f"Action: reduce feed rate by 10%\n"
+             f"  Current feed : {current_feed:.0f} mm/min\n"
+             f"  New feed     : {new_feed:.0f} mm/min  (override = {new_pct:.0f}%)"),
             ("factory",
-             f"Additionally: try shifting RPM ±10–15% to move away from resonance frequency.\n"
-             f"  G-code: F{new_feed}  ; new feed rate\n"
-             f"           S[rpm ± 10%] ; RPM shift if chatter persists"),
+             f"If chatter persists: shift RPM ±10–15% to escape resonance.\n"
+             f"  G-code: F{new_feed}  ; apply immediately\n"
+             f"          S[new_rpm]   ; ±10–15% of current spindle speed"),
             ("machine",
-             f"Feed override set to {new_pct:.0f}%.  Monitoring spindle load."),
+             f"Feed override {new_pct:.0f}% applied.  Monitoring spindle load."),
         ]
 
     def _do_reduce_feed(self, p: dict) -> list[str]:
         """Spindle overload / high cutting force — reduce feed by 10%."""
-        mid    = self._agent.machine_id
-        new_pct = 90.0
+        mid          = self._agent.machine_id
+        new_pct      = 90.0
+        job          = self._agent.current_job
+        current_feed = getattr(job, "feed_rate_mmpm", 1000) if job else 1000
+        new_feed     = round(current_feed * 0.90)
+
         self._inject("Feed / spindle overload")
-        self._resolve("reduce_feed", feed_override_pct=new_pct)
+        if self._agent.active_error is not None:
+            self._resolve("reduce_feed", feed_override_pct=new_pct)
 
         return [
             ("machine",
              f"⚠ {mid}: overload detected."),
             ("factory",
-             f"Action: feed rate override → {new_pct:.0f}%  (−10%).\n"
-             f"  If spindle load remains >90% after one full pass, reduce by a further 10%."),
+             f"Action: reduce feed rate by 10%\n"
+             f"  Current feed : {current_feed:.0f} mm/min\n"
+             f"  New feed     : {new_feed:.0f} mm/min  (override = {new_pct:.0f}%)\n"
+             f"  G-code       : F{new_feed}  ; apply immediately"),
+            ("factory",
+             f"If spindle load remains >90% after one full pass, reduce a further 10%."),
             ("machine",
-             f"Feed override applied.  Continuing machining."),
+             f"Feed override {new_pct:.0f}% applied.  Continuing machining."),
         ]
 
     def _do_abort(self, p: dict) -> list[str]:
         """Explicit abort — retract Z, stop spindle, go home."""
         mid = self._agent.machine_id
         self._inject("Operator requested abort")
-        self._resolve("abort")
+        if self._agent.active_error is not None:
+            self._resolve("abort")
+        if self._msim is not None:
+            self._msim.status = "idle"
 
         return [
             ("machine",
@@ -1208,6 +1311,94 @@ class ActionExecutor:
              f"Machine stopped.  Part moved to rework queue.  "
              f"Reset required before next job."),
         ]
+
+    def _do_wrong_material(self, p: dict) -> list[str]:
+        """
+        Wrong material loaded.
+        Steps: stop → identify correct material → rebuild toolpath → restart.
+        """
+        import config as _cfg
+        import threading
+        mid  = self._agent.machine_id
+        job  = self._agent.current_job
+        msim = self._msim
+        lines: list[str] = []
+
+        # 1. Stop execution
+        self._inject("Wrong material loaded — operator reported")
+        if self._agent.active_error is not None:
+            self._resolve("abort")
+        if msim is not None:
+            msim.status = "idle"
+
+        lines.append(("machine",
+            f"🛑 {mid}: execution stopped — wrong material reported."))
+        lines.append(("factory",
+            f"  G0 Z{self.Z_SAFE_MM:.0f}   ; retract to Z-safe\n"
+            f"  M5         ; spindle stop\n"
+            f"  M9         ; coolant off"))
+
+        # 2. Identify the target material
+        target_material = p.get("material")
+        available       = list(_cfg.MATERIAL_TABLE.keys())
+        avail_str       = "  |  ".join(available)
+
+        if target_material and target_material in _cfg.MATERIAL_TABLE:
+            lines.append(("factory",
+                f"Target material from message: {target_material}"))
+        elif job and getattr(job, "material", None):
+            target_material = job.material
+            lines.append(("factory",
+                f"Using job specification material: {target_material}\n"
+                f"To override, type: set material <name>"))
+        else:
+            target_material = _cfg.DEFAULT_MATERIAL
+            lines.append(("factory",
+                f"No material specified — defaulting to: {target_material}\n"
+                f"Available: {avail_str}\n"
+                f"Type: set material <name> to override"))
+
+        # 3. Rebuild toolpath in background
+        seed = getattr(job, "seed", None) if job else None
+        if seed is not None and self._app is not None:
+            sfm_range, kc = _cfg.MATERIAL_TABLE.get(target_material, ((300, 500), 2000))
+            lines.append(("factory",
+                f"Rebuilding toolpath:\n"
+                f"  Seed     : {seed}\n"
+                f"  Material : {target_material}\n"
+                f"  SFM      : {sfm_range}\n"
+                f"  Kc       : {kc} MPa"))
+            fa_ref  = self._fa
+            app_ref = self._app
+            def _rebuild() -> None:
+                new_job = fa_ref.build_job_from_seed(seed, machine_id=mid)
+                if new_job is not None:
+                    new_job.material = target_material
+                    if msim is not None:
+                        msim.queue.appendleft(new_job)
+                    app_ref.post_chat(
+                        mid, "factory",
+                        f"✅ Toolpath rebuilt for {target_material}  "
+                        f"({len(new_job.gcode_lines)} lines).  "
+                        f"Confirm material loaded and press START.")
+                else:
+                    app_ref.post_chat(
+                        mid, "factory",
+                        f"⚠ Toolpath rebuild failed for Seed {seed}.  "
+                        f"Check CAM pipeline logs.")
+            threading.Thread(target=_rebuild, daemon=True).start()
+            lines.append(("factory",
+                "Toolpath rebuild running in background — "
+                "result posted when complete."))
+        else:
+            lines.append(("factory",
+                "⚠ Cannot auto-regenerate — no seed or app reference.  "
+                "Reload program manually with correct material parameters."))
+
+        lines.append(("machine",
+            f"Machine idle.  Load correct material ({target_material}) "
+            f"and confirm before restarting."))
+        return lines
 
     def _do_unknown(self, p: dict) -> list[str]:
         return [("factory", "Action not recognised — routing to full diagnosis pipeline.")]
