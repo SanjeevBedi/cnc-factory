@@ -1405,6 +1405,23 @@ class FactoryGUI(tk.Tk):
                     "no replacement in factory inventory",
                 )
 
+        # ── 0. Sync CncAgent.status from _MachSim state ──────────────────
+        # agent.status is never written by the GUI tick loop; _MachSim.status
+        # is the authoritative runtime flag.  Map it onto CncAgent.status so
+        # that fa.tick()'s idle/active ledger writes see the correct state.
+        # Only idle⇔running transitions are synced; error states are preserved.
+        _ACTIVE_MSIM = {"setup", "machining", "unclamp", "tool_change"}
+        for _ag in self.fa.agents:
+            _ms = self._msim.get(_ag.machine_id)
+            if _ms is None:
+                continue
+            if _ms.status in _ACTIVE_MSIM:
+                if _ag.status not in ("awaiting_factory", "awaiting_tool_change"):
+                    _ag.status = "running"
+            elif _ms.status == "idle":
+                if _ag.status not in ("awaiting_factory", "awaiting_tool_change"):
+                    _ag.status = "idle"
+
         # ── 1. Factory tick ───────────────────────────────────────────────
         result = self.fa.tick()
         cur_tick = self.fa.scheduler.tick

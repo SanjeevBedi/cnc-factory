@@ -1124,60 +1124,39 @@ class FactoryIntentExecutor:
 
     def _do_factory_idle_time(self, p: dict) -> dict:
         """
-        Idle time per machine — always returns real numbers.
+        Idle time per machine — always shows real measured durations.
 
-        Data sources (in priority order):
-          1. FactoryLedger (if idle events are recorded)
-          2. GUI _completed_parts → infer busy time, idle = total - busy
-             + live _msim status for the current period
-        Both paths show: idle ticks, idle %, idle time (min), current status.
+        Totals are ALWAYS derived from _completed_parts + _msim (reliable).
+        The ledger provides idle-period HISTORY (when periods happened).
+        This avoids showing zeros if the ledger was cold or mis-tracked.
         """
         machine_id = p.get("machine_id")
         tick       = self._tick()
-        t_tick_s   = getattr(__import__("config"), "T_TICK_S", 5.0)
+        import config as _cfg
+        t_tick_s   = _cfg.T_TICK_S
+        t_real_s   = self._t_real_s()
 
-        # ── Build per-machine status from live sources ────────────────────
-        # agent.status is the authoritative runtime flag (set by GUI _MachSim)
         agent_map: dict = {ag.machine_id: ag for ag in self._fa.agents}
-        # _msim tells us if G-code is currently executing
-        msim_map  = self._msim  # mid → _MachSim (may be empty)
+        msim_map        = self._msim           # mid → _MachSim
 
-        def _current_status(mid: str) -> str:
-            ag   = agent_map.get(mid)
-            msim = msim_map.get(mid)
-            if msim is not None:
-                if getattr(msim, "current_job", None) is not None:
-                    return "machining"
-                q = getattr(msim, "queue", [])
-                if q:
-                    return "loading"
-            if ag:
-                return ag.status
-            return "unknown"
+        # ── Build busy-tick totals from _completed_parts (always correct) ──
+        from collections import defaultdict
+        busy_ticks_map: dict = defaultdict(float)
+        job_counts:     dict = defaultdict(int)
 
-        # ── Source 1: ledger idle events ──────────────────────────────────
-        ledger_summary = self._ledger.idle_summary(machine_id, current_tick=tick)
-
-        # ── Source 2: GUI _completed_parts timing ─────────────────────────
         gui_done: list = []
         if self._app is not None:
             gui_done = list(getattr(self._app, "_completed_parts", []))
 
-        # Compute busy ticks per machine from completed jobs + current job
-        from collections import defaultdict
-        import config as _cfg
-        busy_ticks_map: dict = defaultdict(float)
-        job_counts:     dict = defaultdict(int)
-
         for cp in gui_done:
-            m2     = cp.get("machine", "")
+            m2      = cp.get("machine", "")
             total_s = (cp.get("machining_s", 0)
                        + cp.get("load_s", 0)
                        + cp.get("unload_s", 0))
-            busy_ticks_map[m2] += total_s / _cfg.T_TICK_S
+            busy_ticks_map[m2] += total_s / t_tick_s
             job_counts[m2]     += 1
 
-        # Add currently running job (partial progress from _msim cursor)
+        # Add in-progress job fraction from _msim
         for ag in self._fa.agents:
             msim = msim_map.get(ag.machine_id)
             if msim is None:
@@ -1188,114 +1167,130 @@ class FactoryIntentExecutor:
             glines = getattr(msim, "gcode_lines", [])
             cursor = getattr(msim, "gcode_cursor", 0)
             tot    = len(glines)
-            if tot > 0:
-                frac    = cursor / tot
-                est_s   = getattr(cur_job, "estimated_time_s", 0)
-                busy_s  = frac * (est_s + _cfg.PART_SETUP_TIME_S + _cfg.PART_REMOVAL_TIME_S)
-                busy_ticks_map[ag.machine_id] += busy_s / _cfg.T_TICK_S
+            est_s  = getattr(cur_job, "estimated_time_s", 0)
+            total_cycle_s = est_s + _cfg.PART_SETUP_TIME_S + _cfg.PART_REMOVAL_TIME_S
+            frac   = (cursor / tot) if tot > 0 else 0.0
+            busy_ticks_map[ag.machine_id] += frac * total_cycle_s / t_tick_s
 
-        # ── Choose which source has data ──────────────────────────────────
-        has_ledger = bool(ledger_summary)
-        has_gui    = bool(gui_done) and tick > 0
-        all_mids   = sorted(
-            set(list(agent_map.keys())
-                + list(ledger_summary.keys())
-                + [cp.get("machine","") for cp in gui_done if cp.get("machine")])
-        )
+        # ── Current machine status (from msim, not agent.status) ─────────
+        def _msim_status(mid: str) -> str:
+            ms = msim_map.get(mid)
+            if ms is None:
+                ag = agent_map.get(mid)
+                return ag.status if ag else "unknown"
+            st = getattr(ms, "status", "idle")
+            if st == "machining":    return "▶ machining"
+            if st in ("setup","unclamp"): return "◎ loading/unclamp"
+            if st == "tool_change":  return "🔧 tool change"
+            ag = agent_map.get(mid)
+            if ag and ag.status == "awaiting_factory": return "⚠ waiting"
+            return "○ idle"
+
+        # ── Assemble per-machine rows ────────────────────────────────────
+        all_mids = sorted(agent_map.keys())
         if machine_id:
             all_mids = [m for m in all_mids if m == machine_id]
 
-        t_real_s = self._t_real_s()
         lines = [
             f"Idle time per machine — tick {tick}  "
-            f"({t_real_s/60:.1f} sim-min  ×{_cfg.T_TICK_S:.0f}s/tick)",
-            f"  Shift elapsed: {t_real_s/60:.1f} min  "
-            f"(policy: {self._fa.policy})",
+            f"({t_real_s/60:.1f} sim-min  ×{t_tick_s:.0f}s/tick)",
+            f"  Shift elapsed: {t_real_s/60:.1f} min   policy: {self._fa.policy}",
             "",
+            f"  {'Machine':<6}  {'Status':<18}  "
+            f"{'Busy time':>10}  {'Idle time':>10}  {'Idle %':>7}  "
+            f"{'Jobs done':>10}",
+            "  " + "─" * 70,
         ]
 
-        # Header
-        lines.append(
-            f"  {'Machine':<6}  {'Status':<12}  "
-            f"{'Idle time':>12}  {'Idle %':>7}  "
-            f"{'Busy time':>12}  {'Jobs done':>10}  {'Idle periods'}"
-        )
-        lines.append("  " + "─" * 76)
-
         for mid in all_mids:
-            cur_status = _current_status(mid)
-
-            if has_ledger and mid in ledger_summary:
-                d          = ledger_summary[mid]
-                idle_ticks = d["total_idle_ticks"]
-                n_periods  = d["n_idle_periods"]
-            elif has_gui:
-                bt         = busy_ticks_map.get(mid, 0.0)
-                idle_ticks = max(0.0, tick - bt)
-                n_periods  = job_counts.get(mid, 0)
-            else:
-                idle_ticks = 0.0
-                n_periods  = 0
-
-            busy_ticks = max(0.0, tick - idle_ticks)
-            idle_pct   = (idle_ticks / tick * 100) if tick > 0 else 0.0
-            idle_min   = idle_ticks * _cfg.T_TICK_S / 60
-            busy_min   = busy_ticks * _cfg.T_TICK_S / 60
-            n_jobs     = job_counts.get(mid, 0)
-
-            # Status indicator
-            if cur_status == "machining":
-                status_str = "▶ machining"
-            elif cur_status in ("idle", ""):
-                status_str = "○ idle"
-            elif cur_status == "loading":
-                status_str = "◎ loading"
-            elif cur_status == "awaiting_factory":
-                status_str = "⚠ waiting"
-            else:
-                status_str = cur_status
-
+            bt       = busy_ticks_map.get(mid, 0.0)
+            it       = max(0.0, tick - bt)
+            idle_pct = (it / tick * 100) if tick > 0 else 0.0
+            busy_min = bt * t_tick_s / 60
+            idle_min = it * t_tick_s / 60
+            n_jobs   = job_counts.get(mid, 0)
+            status   = _msim_status(mid)
             lines.append(
-                f"  {mid:<6}  {status_str:<12}  "
-                f"{idle_min:>10.1f}m  {idle_pct:>6.1f}%  "
-                f"{busy_min:>10.1f}m  {n_jobs:>10}  "
-                f"{n_periods} period(s)"
+                f"  {mid:<6}  {status:<18}  "
+                f"{busy_min:>9.1f}m  {idle_min:>9.1f}m  {idle_pct:>6.1f}%  "
+                f"{n_jobs:>10}"
             )
 
-        # ── Current idle streak detail ────────────────────────────────────
+        # ── Current idle streaks ─────────────────────────────────────────
         lines.append("")
         lines.append("  Current idle streaks:")
         any_idle = False
         for mid in all_mids:
-            ag  = agent_map.get(mid)
-            if ag is None:
+            status = _msim_status(mid)
+            if "idle" not in status:
                 continue
-            cur = _current_status(mid)
-            if cur not in ("idle", "○ idle", ""):
-                continue
-            # Find open idle event
             open_ev = self._ledger._open_idle.get(mid)
-            if open_ev:
+            if open_ev and open_ev.start_tick > 0:
                 streak_ticks = max(0, tick - open_ev.start_tick)
-                streak_min   = streak_ticks * _cfg.T_TICK_S / 60
+                streak_min   = streak_ticks * t_tick_s / 60
                 lines.append(
-                    f"    {mid}  idle since tick {open_ev.start_tick}  "
-                    f"→  {streak_min:.1f} min  ({streak_ticks} ticks)"
+                    f"    {mid}  idle since tick {open_ev.start_tick}"
+                    f"  →  {streak_min:.1f} min  ({streak_ticks} ticks)"
                 )
             else:
-                lines.append(f"    {mid}  currently idle  (streak not in ledger)")
+                lines.append(f"    {mid}  currently idle  (no open ledger event)")
             any_idle = True
         if not any_idle:
             lines.append("    No machines currently idle.")
 
-        data_src = ("ledger" if has_ledger else
-                    "completed-parts estimate" if has_gui else
-                    "live agent status only")
+        # ── Idle period history (from ledger) ────────────────────────────
+        # Only show if ledger has meaningful history (more than one period
+        # per machine, or periods that have been closed).
+        ledger_events = self._ledger.idle_events
+        closed_events = [e for e in ledger_events if e.end_tick >= 0]
+        if closed_events or len(ledger_events) > len(all_mids):
+            lines.append("")
+            lines.append("  Idle period history (last 5 closed periods per machine):")
+            for mid in all_mids:
+                machine_events = [
+                    e for e in ledger_events
+                    if e.machine_id == mid and e.end_tick >= 0
+                ]
+                # Filter out trivially short gaps (1-2 ticks = sync lag)
+                machine_events = [
+                    e for e in machine_events
+                    if (e.end_tick - e.start_tick) > 2
+                ]
+                if not machine_events:
+                    continue
+                lines.append(f"    ─ {mid} ─" + "─" * 50)
+                lines.append(
+                    f"    {'#':<4} {'Start tick':>12} {'End tick':>10} "
+                    f"{'Duration':>12} {'Reason'}"
+                )
+                for i, ev in enumerate(machine_events[-5:], 1):
+                    dur_ticks = ev.end_tick - ev.start_tick
+                    dur_min   = dur_ticks * t_tick_s / 60
+                    lines.append(
+                        f"    {i:<4} {ev.start_tick:>12} {ev.end_tick:>10} "
+                        f"{dur_min:>10.1f}m  {ev.reason}"
+                    )
+                # Show open event if any
+                open_ev = self._ledger._open_idle.get(mid)
+                if open_ev:
+                    dur_min = max(0, tick - open_ev.start_tick) * t_tick_s / 60
+                    lines.append(
+                        f"    {'now':<4} {open_ev.start_tick:>12} {'(open)':>10} "
+                        f"{dur_min:>10.1f}m  {open_ev.reason} ← current"
+                    )
+
+        data_src = (
+            "ledger + completed-parts" if closed_events
+            else "completed-parts estimate"
+            if gui_done
+            else "live agent status"
+        )
         lines.append("")
         lines.append(f"  Data source: {data_src}")
 
         return {"intent": "factory_idle_time",
-                "result": "\n".join(lines), "raw": ledger_summary}
+                "result": "\n".join(lines), "raw": {}}
+
 
     def _do_factory_tool_usage_history(self, p: dict) -> dict:
         n      = int(p.get("n", 20))
