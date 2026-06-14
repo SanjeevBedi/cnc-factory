@@ -128,7 +128,7 @@ SIM_IDLE_PCT:      float = 10   # % of shift time machines are idle
 #
 # Raising this lets the CAM pipeline run further ahead so machines never
 # starve; lowering it keeps memory and queue latency small.
-SIM_MAX_AHEAD_PER_MACHINE: int = 2
+SIM_MAX_AHEAD_PER_MACHINE: int = 1
 
 # ── Reproducibility ──────────────────────────────────────────────────────────
 # Fixed RNG seed used for ALL random decisions in the simulation:
@@ -140,9 +140,10 @@ SIM_RNG_SEED: int = 42
 
 # ── Wall-clock speed ─────────────────────────────────────────────────────────
 # GUI speed slider multiplies the wall sleep:  sleep = T_TICK_S / SIM_COMPRESSION / speed
-# SIM_COMPRESSION is chosen so that 1 full shift takes SIM_TARGET_WALL_S seconds at 1×.
+# SIM_COMPRESSION = T_TICK_S → wall_sleep_base = 1.0 s/tick  (1 sim-tick = 1 wall-second at 1×).
+# Raise SIM_COMPRESSION to run faster (e.g. _SHIFT_S / 180.0 ≈ 160× for 3-min shift).
 SIM_TARGET_WALL_S:  float = 180.0                                   # 3 min wall-clock per shift at 1×
-SIM_COMPRESSION:    float = _SHIFT_S / SIM_TARGET_WALL_S            # ≈ 160×
+SIM_COMPRESSION:    float = T_TICK_S                                # 1 wall-second per tick at 1×
 
 # ── GUI repaint cap ───────────────────────────────────────────────────────────
 SIM_GUI_MAX_FPS:   int = 30

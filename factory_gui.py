@@ -1663,10 +1663,19 @@ class FactoryGUI(tk.Tk):
         WITHOUT enqueuing a job.  Call this BEFORE build_job_from_seed() so
         the correct machine's crib is used for tool selection.
         Returns machine_id, or None if all machines are disabled.
+
+        If an AI-dispatched routing override is active (self._routing_fn),
+        it is called instead.  The override is a plain callable
+        (eligible: list[tuple[str,_MachSim]]) -> str and lives only in
+        memory — it vanishes when the program exits.
         """
         eligible = [(mid, m) for mid, m in self._msim.items() if m.enabled]
         if not eligible:
             return None
+        # AI hotswap hook — set by FactoryActionExecutor at runtime
+        fn = getattr(self, "_routing_fn", None)
+        if fn is not None:
+            return fn(eligible)
         mid, _ = min(eligible, key=lambda x: len(x[1].queue))
         return mid
 

@@ -243,6 +243,15 @@ FACTORY_INTENT_CATALOGUE: list[FactoryIntent] = [
 
     # ── ADVISORY — AI analysis ─────────────────────────────────────────────────
     FactoryIntent(
+        "factory_scheduling_advice", "advisory",
+        "Scheduling strategy analysis",
+        "Analyse current FIFO scheduling, compute per-machine utilisation from "
+        "ledger data, compare batch/round-robin/random-assignment strategies "
+        "with concrete numbers from the live run.",
+        ("question",),
+        example='{"intent":"factory_scheduling_advice","question":"how should we schedule parts?"}',
+    ),
+    FactoryIntent(
         "factory_ai_advice", "advisory",
         "AI factory performance analysis",
         "Compile full factory context (ledger, KPIs, machine intents, tool state) "
@@ -644,6 +653,19 @@ _FACTORY_QUERY_KEYWORDS: dict[str, list[str]] = {
 }
 
 
+# Advisory markers — if ANY appear in a message longer than 12 words,
+# the message is treated as strategic advice, not a data query —
+# even if it contains a query keyword (e.g. "idle time is 20%, not good,
+# can we improve scheduling?" → advisory).
+_ADVISORY_MARKERS = [
+    "can we", "could we", "should we", "not good", "too much",
+    "best way", "better way", "reduce", "avoid",
+    "batch", "random", "scheduling", "release together",
+    "what is the best", "how do we", "how should",
+    "any ideas", "what do you think", "recommendation",
+]
+
+
 def classify_factory_message(text: str) -> tuple[str, Optional[str]]:
     """
     Classify operator text at the factory level.
@@ -652,8 +674,21 @@ def classify_factory_message(text: str) -> tuple[str, Optional[str]]:
       ("query",  intent_id)  — data query; execute via FactoryIntentExecutor
       ("action", None)       — action / advisory; classify further with
                                classify_factory_action()
+
+    Step 0: complexity guard — long messages with advisory markers → action
+    Step 1: action-signal words → action
+    Step 2: exact phrase scan → query
+    Step 3: token-combination fallback → query
+    Step 4: default → action
     """
     lower = text.lower()
+
+    # 0. Complexity guard: messages >12 words containing advisory markers
+    #    are strategic even when they mention query keywords like "idle time".
+    if len(text.split()) > 12:
+        for marker in _ADVISORY_MARKERS:
+            if marker in lower:
+                return ("action", None)
 
     # 1. Action-signal words short-circuit
     for sig in _FACTORY_ACTION_SIGNALS:
@@ -741,6 +776,15 @@ _FACTORY_ACTION_PATTERNS: list[tuple[str, list[str]]] = [
     ("factory_set_policy", [
         "set policy", "change policy", "switch policy",
         "use policy", "policy to", "change to",
+    ]),
+    ("factory_scheduling_advice", [
+        "scheduling", "schedule parts", "batch", "batching",
+        "collect parts", "release together", "random machine",
+        "random assignment", "not in order", "avoid idle",
+        "reduce idle", "fifo", "order received", "dispatch",
+        "how are parts scheduled", "how should parts be scheduled",
+        "scheduling strategy", "best scheduling",
+        "not good", "can we look at how", "what is the best way",
     ]),
     ("factory_ai_advice", [
         "advise", "advice", "analyse", "analyze",
@@ -1459,6 +1503,16 @@ class FactoryActionExecutor:
 
     def execute(self, action_type: str, parameters: dict) -> list[tuple]:
         """Returns list of (speaker, text) tuples."""
+        # Normalise: factory_scheduling_advice can also arrive as
+        # factory_ai_advice with scheduling keywords in the question
+        q = parameters.get("question", "").lower()
+        _SCHED_KEYS = [
+            "schedul", "batch", "fifo", "random", "dispatch",
+            "collect parts", "release together", "idle time",
+            "not in order", "round.robin", "assign",
+        ]
+        if action_type == "factory_ai_advice" and any(k in q for k in _SCHED_KEYS):
+            action_type = "factory_scheduling_advice"
         handler = getattr(self, f"_do_{action_type}", self._do_unknown)
         return handler(parameters)
 
@@ -1639,6 +1693,246 @@ class FactoryActionExecutor:
              f"  Takes effect for all future job assignments."),
         ]
 
+
+    def _do_factory_scheduling_advice(self, p: dict) -> list[tuple]:
+        """
+        Deterministic scheduling strategy analysis.
+        Answers: FIFO vs batch vs random assignment, with real numbers
+        from the live run (no OpenAI required).
+        """
+        import config as _cfg
+        from collections import defaultdict
+
+        tick     = self._tick()
+        t_tick_s = _cfg.T_TICK_S
+        t_real_s = tick * t_tick_s
+
+        # ── Gather completed-job data ─────────────────────────────────────
+        gui_done: list = []
+        if self._app is not None:
+            gui_done = list(getattr(self._app, "_completed_parts", []))
+
+        # Per-machine busy ticks from completed jobs
+        busy_map:  dict = defaultdict(float)
+        job_count: dict = defaultdict(int)
+        job_times: dict = defaultdict(list)   # mid → [total_s, ...]
+
+        for cp in gui_done:
+            m2      = cp.get("machine", "")
+            total_s = (cp.get("machining_s", 0)
+                       + cp.get("load_s", 0)
+                       + cp.get("unload_s", 0))
+            busy_map[m2]  += total_s / t_tick_s
+            job_count[m2] += 1
+            job_times[m2].append(total_s)
+
+        # Add currently running jobs
+        for ag in self._fa.agents:
+            msim = self._msim.get(ag.machine_id)
+            if msim is None:
+                continue
+            cur = getattr(msim, "current_job", None)
+            if cur is None:
+                continue
+            g = getattr(msim, "gcode_lines", [])
+            c = getattr(msim, "gcode_cursor", 0)
+            if len(g) > 0:
+                frac  = c / len(g)
+                est_s = getattr(cur, "estimated_time_s", 0)
+                busy_map[ag.machine_id] += frac * (
+                    est_s + _cfg.PART_SETUP_TIME_S + _cfg.PART_REMOVAL_TIME_S
+                ) / t_tick_s
+
+        all_mids = sorted(self._fa.agents, key=lambda a: a.machine_id)
+        all_mids = [a.machine_id for a in all_mids]
+        n_machines = len(all_mids)
+        total_jobs = sum(job_count.values())
+        total_busy = sum(busy_map.values())
+
+        # ── Section 1: What the data actually shows ───────────────────────
+        lines = [
+            "Scheduling Strategy Analysis",
+            "═" * 58,
+            "",
+            "SECTION 1 — Current utilisation (what the data shows)",
+            "─" * 58,
+        ]
+        if tick == 0 or total_jobs == 0:
+            lines.append("  No completed jobs yet — run the simulation longer.")
+        else:
+            lines.append(
+                f"  {'Machine':<6}  {'Jobs':>6}  {'Busy time':>10}  "
+                f"{'Idle time':>10}  {'Util %':>7}  {'Avg job':>9}"
+            )
+            lines.append("  " + "─" * 54)
+            for mid in all_mids:
+                bt   = busy_map.get(mid, 0.0)
+                it   = max(0.0, tick - bt)
+                pct  = (bt / tick * 100) if tick > 0 else 0.0
+                nj   = job_count.get(mid, 0)
+                avg_s = (sum(job_times.get(mid, [0])) / max(1, nj))
+                lines.append(
+                    f"  {mid:<6}  {nj:>6}  {bt*t_tick_s/60:>9.1f}m  "
+                    f"{it*t_tick_s/60:>9.1f}m  {pct:>6.1f}%  "
+                    f"{avg_s/60:>8.1f}m"
+                )
+            # Overall
+            overall_util = (total_busy / (tick * n_machines) * 100) if tick > 0 else 0
+            lines.append("  " + "─" * 54)
+            lines.append(
+                f"  {'FLEET':<6}  {total_jobs:>6}  "
+                f"{total_busy*t_tick_s/60:>9.1f}m  "
+                f"  {'':>9}  {overall_util:>6.1f}%"
+            )
+            lines.append("")
+            # Imbalance diagnosis
+            if n_machines > 1:
+                job_counts_list = [job_count.get(m, 0) for m in all_mids]
+                max_j  = max(job_counts_list)
+                min_j  = min(job_counts_list)
+                busiest = all_mids[job_counts_list.index(max_j)]
+                idlest  = all_mids[job_counts_list.index(min_j)]
+                imbalance_ratio = (max_j / max(1, min_j))
+                if imbalance_ratio >= 3:
+                    lines.append(
+                        f"  ⚠  SEVERE IMBALANCE: {busiest} ran {max_j} jobs  vs  "
+                        f"{idlest} ran {min_j} jobs  (ratio {imbalance_ratio:.1f}×)"
+                    )
+                    lines.append(
+                        f"     This is a ROUTING problem, not a scheduling problem.")
+                    lines.append(
+                        f"     Jobs are being preferentially sent to {busiest}/{all_mids[1]}.")
+                elif imbalance_ratio >= 1.5:
+                    lines.append(
+                        f"  ⚡  Mild imbalance: {busiest} ({max_j} jobs) vs "
+                        f"{idlest} ({min_j} jobs).  Routing improvement recommended.")
+
+        # ── Section 2: Current strategy (FIFO + shortest-queue routing) ──
+        lines += [
+            "",
+            "SECTION 2 — Your current strategy",
+            "─" * 58,
+            "  Routing:    Shortest queue among enabled machines",
+            "  Dispatch:   Immediate (job enters queue as soon as CAM completes)",
+            "  Order:      Seed-order (jobs are offered as auto-seed generates them)",
+            "",
+            "  ✓  Low latency — each part starts as soon as a machine is free",
+            "  ✓  Simple and predictable",
+            "  ✗  No look-ahead — cannot group similar parts for faster setup",
+            "  ✗  Starvation if CAM throughput is slower than machining throughput",
+            "     (M03/M04 sit idle waiting for seeds to be generated)",
+        ]
+
+        # ── Section 3: Strategy options ───────────────────────────────────
+        avg_job_min = 0.0
+        if gui_done:
+            all_totals = [
+                cp.get("machining_s", 0) + cp.get("load_s", 0) + cp.get("unload_s", 0)
+                for cp in gui_done
+            ]
+            avg_job_min = (sum(all_totals) / len(all_totals)) / 60
+
+        batch_size = n_machines  # collect one job per machine then release
+
+        lines += [
+            "",
+            "SECTION 3 — Strategy comparison",
+            "─" * 58,
+            "",
+            f"  Avg job cycle time: {avg_job_min:.1f} min",
+            f"  Machines: {n_machines}",
+            "",
+            "  A)  ROUND-ROBIN assignment  (immediate fix for starvation)",
+            "      Send job 1 → M01, job 2 → M02, job 3 → M03, job 4 → M04,",
+            "      job 5 → M01 again.  Guarantees equal share regardless of",
+            "      queue depth differences.",
+            f"      Expected utilisation gain: from {overall_util:.0f}% → ~{min(95, overall_util * n_machines / max(1, sum(1 for m in all_mids if job_count.get(m, 0) > 0))):.0f}%",
+            "      Latency impact: none — still immediate dispatch.",
+            "      ⚡ Recommended for your current situation.",
+            "",
+            f"  B)  BATCH scheduling  (collect {batch_size} jobs, release together)",
+            f"      Hold jobs until {batch_size} are ready, then dispatch one to",
+            "      each machine simultaneously.  Ensures all machines start",
+            "      together after every tool change / setup cycle.",
+            f"      Batch fill time at current seed rate: ~{avg_job_min * 0.3:.1f} min",
+            f"        (assuming CAM is ~30% of job cycle time)",
+            "      ✓  Eliminates inter-job idle gaps between machines.",
+            "      ✗  First part of each batch waits up to (batch fill time)",
+            f"         before it starts.  Adds ~{avg_job_min * 0.3:.1f} min latency.",
+            "      Suitable for: high-volume identical parts (same seed).",
+            "",
+            "  C)  RANDOM assignment",
+            "      Choose machine randomly (uniform) from enabled machines.",
+            "      Statistically approaches round-robin over many jobs.",
+            "      ✓  Simple.  ✗  Can cluster jobs on one machine by bad luck.",
+            "      Inferior to round-robin for small job counts.",
+            "",
+            "  D)  LEAST-LOADED (current) + CAM pre-warming",
+            "      Keep the current shortest-queue routing but start CAM for",
+            f"      the NEXT {batch_size} seeds in background before machines finish.",
+            "      Jobs are ready to dispatch the moment a machine goes idle.",
+            "      ✓  No latency increase.  ✓  Fills idle gaps.",
+            "      ✗  Requires pre-seeding logic (seeds must be known ahead).",
+        ]
+
+        # ── Section 4: Concrete recommendation ───────────────────────────
+        lines += [
+            "",
+            "SECTION 4 — Recommendation for your situation",
+            "─" * 58,
+        ]
+
+        imb = (max(job_count.values()) / max(1, min(job_count.values()))
+               if job_count else 1)
+        if imb >= 3:
+            rec = "A — Round-robin routing"
+            reason = (
+                f"Your job distribution is severely unbalanced ({imb:.1f}× ratio).\n"
+                f"  Round-robin will immediately share load across all {n_machines} machines\n"
+                f"  without any latency penalty."
+            )
+            action = "  → In factory_gui.py: change _route_dest_only() to use a\n     rotating counter instead of min(queue length)."
+        elif overall_util < 50:
+            rec = "D — Pre-warm CAM pipeline"
+            reason = (
+                f"Fleet utilisation is {overall_util:.0f}%.  The bottleneck is seed\n"
+                f"  generation speed, not scheduling.  Pre-warming CAM keeps jobs\n"
+                f"  ready so machines never wait."
+            )
+            action = "  → Increase SIM_MAX_AHEAD_PER_MACHINE in config.py\n     or increase auto-seed probability."
+        else:
+            rec = "B — Batch scheduling"
+            reason = (
+                f"Utilisation is {overall_util:.0f}%.  Batching {batch_size} jobs (one per\n"
+                f"  machine) before dispatching will synchronise machine cycles\n"
+                f"  and reduce inter-job idle time."
+            )
+            action = f"  → Collect {batch_size} CAM-ready jobs before releasing any."
+
+        lines += [
+            f"  BEST STRATEGY: {rec}",
+            f"  Reason: {reason}",
+            f"  How to implement:",
+            action,
+            "",
+            "  Also useful regardless of strategy chosen:",
+            "    • 'set policy min_time'  — uses largest tools / highest feeds",
+            "    • Increase SIM_MAX_AHEAD_PER_MACHINE to pre-fill machine queues",
+            "    • Monitor tool life — tool changes cause unexpected idle gaps",
+        ]
+
+        out = [("factory", "\n".join(lines))]
+        # When the question asks for a recommendation (not just a report),
+        # chain into _do_factory_ai_advice so the hotswap fires.
+        q = p.get("question", "").lower()
+        _HOTSWAP_TRIGGERS = [
+            "best way", "can we", "should we", "improve", "fix",
+            "what do", "recommend", "advise", "not good",
+        ]
+        if any(k in q for k in _HOTSWAP_TRIGGERS):
+            out += self._do_factory_ai_advice(p)
+        return out
+
     def _do_factory_ai_advice(self, p: dict) -> list[tuple]:
         """
         Compile full factory context → send to OpenAI → parse response
@@ -1726,9 +2020,112 @@ class FactoryActionExecutor:
                 f"⚠ {pending} action(s) require operator confirmation.\n"
                 f"To execute: type 'confirm <intent> on <target>'"))
 
+        # ── 4. Hotswap routing strategy if AI recommended one ────────────────
+        routing_strat   = response.get("routing_strategy")
+        routing_reason  = response.get("routing_reasoning", "")
+        if routing_strat and routing_strat != "shortest_queue":
+            lines.extend(
+                self._hotswap_routing(routing_strat, routing_reason)
+            )
+
         return lines
 
     # ── AI advisory helpers ───────────────────────────────────────────────────
+
+
+    def _hotswap_routing(self, strategy: str, reasoning: str) -> list[tuple]:
+        """
+        Install a live routing function into the GUI at runtime.
+
+        The function is stored as app._routing_fn — a plain callable that
+        _route_dest_only() consults on every job assignment.  It lives only
+        in process memory: program exit removes it automatically with no
+        config files touched.
+
+        strategy: "round_robin" | "random" | "shortest_queue" (clears override)
+        """
+        app = self._app
+        if app is None:
+            return [("factory", "⚠ Routing hotswap unavailable — no app reference.")]
+
+        prev_strategy = getattr(app, "_routing_strategy_name", "shortest_queue")
+
+        if strategy == "round_robin":
+            state = {"idx": 0}   # stateful counter lives in the closure
+            def _round_robin_fn(eligible):
+                mids = sorted(mid for mid, _ in eligible)
+                mid  = mids[state["idx"] % len(mids)]
+                state["idx"] += 1
+                return mid
+            app._routing_fn            = _round_robin_fn
+            app._routing_strategy_name = "round_robin"
+            strategy_desc = (
+                "Round-robin  "
+                "(job 1→M01, job 2→M02, job 3→M03, job 4→M04, job 5→M01…)"
+            )
+        elif strategy == "random":
+            import random as _rnd
+            def _random_fn(eligible):
+                return _rnd.choice([mid for mid, _ in eligible])
+            app._routing_fn            = _random_fn
+            app._routing_strategy_name = "random"
+            strategy_desc = "Random (uniform selection from enabled machines)"
+        else:   # "shortest_queue" or unknown — clear override
+            app._routing_fn            = None
+            app._routing_strategy_name = "shortest_queue"
+            strategy_desc = "Shortest queue (least-loaded machine, original default)"
+
+        import config as _cfg
+        from collections import Counter
+        gui_done   = list(getattr(app, "_completed_parts", []))
+        dist       = Counter(cp.get("machine", "") for cp in gui_done)
+        tick       = self._tick()
+        n_mach     = len(self._fa.agents)
+
+        lines: list[tuple] = [
+            ("factory",
+             "🔄 ROUTING HOTSWAP  [" + prev_strategy + "  →  " + strategy + "]"),
+            ("factory",
+             "Strategy now active: " + strategy_desc + "\n"
+             "Reasoning: " + reasoning + "\n\n"
+             "This override lives in memory only.\n"
+             "It is removed automatically when the program exits."),
+        ]
+
+        if dist:
+            max_j  = max(dist.values())
+            bar_w  = 20
+            blines = ["Before hotswap — job distribution:"]
+            for mid in sorted(dist):
+                n   = dist[mid]
+                bar = "█" * round(n / max_j * bar_w)
+                blines.append("  " + mid + "  " + bar.ljust(bar_w) + "  " + str(n) + " jobs")
+            lines.append(("factory", "\n".join(blines)))
+
+        total_busy_ticks = sum(
+            (cp.get("machining_s", 0) + cp.get("load_s", 0) + cp.get("unload_s", 0))
+            / _cfg.T_TICK_S
+            for cp in gui_done
+        )
+        current_util = (
+            total_busy_ticks / max(1, tick * n_mach) * 100
+            if tick > 0 else 0.0
+        )
+        # With round-robin, all machines share equally → utilisation approaches
+        # total_busy / (tick * n_machines) but distributed evenly
+        expected_util = min(98.0, current_util * n_mach / max(1, len(dist)))
+        expected_each = len(gui_done) / max(1, n_mach)
+
+        lines.append(("factory",
+            "Expected effect after hotswap:\n"
+            "  Each machine will receive ~" + f"{expected_each:.0f}" + " jobs"
+            " (was: uneven — see distribution above)\n"
+            "  Fleet utilisation target: " + f"{expected_util:.0f}" + "%"
+            "  (current: " + f"{current_util:.0f}" + "%)\n\n"
+            "To revert: type 'set routing shortest_queue' in this chat."))
+
+        return lines
+
 
     def _compile_factory_context(self, question: str) -> str:
         """
@@ -1849,10 +2246,13 @@ class FactoryActionExecutor:
             "You are an AI advisor for a CNC factory.  "
             "Analyse the provided factory state, ledger, and intent catalogues, "
             "then respond with a JSON object that specifies:\n"
-            "  recommendation — plain-text advice (2-4 sentences)\n"
-            "  actions        — list of specific intents to execute\n"
+            "  recommendation    — plain-text advice (2-4 sentences)\n"
+            "  actions           — list of specific intents to execute\n"
             "  policy_suggestion — recommended scheduling policy or null\n"
-            "  reasoning      — explanation\n"
+            "  routing_strategy  — one of: null | \"round_robin\" | \"random\" | \"shortest_queue\"\n"
+            "                      Set this when job distribution is unbalanced across machines.\n"
+            "  routing_reasoning — why this routing strategy will help (one sentence)\n"
+            "  reasoning         — overall explanation\n"
             "Do not include prose outside the JSON object."
         )
         try:
@@ -1913,7 +2313,43 @@ class FactoryActionExecutor:
                 "parameters": {"policy": "best_finish"},
                 "reasoning": "Reduce rework by improving surface quality.",
             })
-        if "idle" in lower:
+        if "idle" in lower or "schedul" in lower or "routing" in lower:
+            # Check for machine imbalance using completed-parts data
+            gui_done = list(getattr(getattr(self, "_app", None),
+                                    "_completed_parts", []))
+            from collections import Counter
+            dist = Counter(cp.get("machine", "") for cp in gui_done)
+            if dist:
+                max_j = max(dist.values())
+                min_j = min(dist.values())
+                if max_j > 0 and (max_j / max(1, min_j)) >= 2.5:
+                    busiest = max(dist, key=dist.get)
+                    idlest  = min(dist, key=dist.get)
+                    recs.append(
+                        f"Machine distribution is severely unbalanced: {busiest} ran "
+                        f"{max_j} jobs vs {idlest} ran {min_j} jobs.  "
+                        f"Switching to round-robin routing will immediately "
+                        f"balance load across all machines."
+                    )
+                    acts.append({
+                        "target": "factory",
+                        "intent": "factory_set_routing",  # logical only — hotswap below
+                        "parameters": {"routing_strategy": "round_robin"},
+                        "reasoning": "Eliminates job starvation on under-utilised machines.",
+                    })
+                    return {
+                        "recommendation": "  ".join(recs),
+                        "actions": acts,
+                        "policy_suggestion": None,
+                        "routing_strategy": "round_robin",
+                        "routing_reasoning": (
+                            f"Job distribution is {max_j / max(1, min_j):.1f}× "
+                            f"unbalanced ({busiest} vs {idlest}).  "
+                            f"Round-robin guarantees each machine receives "
+                            f"every 4th job regardless of queue state."
+                        ),
+                        "reasoning": "[Rule-based — imbalance detected from completed-parts data]",
+                    }
             recs.append(
                 "To reduce idle time: ensure the queue always has jobs ready "
                 "by pre-running the CAM pipeline on the next seeds."
