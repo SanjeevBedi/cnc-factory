@@ -158,6 +158,27 @@ INTENT_CATALOGUE: list[AgentIntent] = [
         ("tool_id",),
         example='{"intent":"replan_remaining","tool_id":"T5"}'),
 
+    AgentIntent("query_current_part",  "program", "Query current part being machined",
+        "Return seed ID, material, tool in use, current section, completed sections, "
+        "G-code progress bar, and estimated time for the part on the table.",
+        (), example='{"intent":"query_current_part"}'),
+
+    AgentIntent("query_gcode_current", "program", "Query current G-code line",
+        "Return the G-code instruction the machine is executing right now.",
+        (), example='{"intent":"query_gcode_current"}'),
+
+    AgentIntent("query_gcode_history", "program", "Query last N G-code lines executed",
+        "Return the last N G-code lines that have already been executed.",
+        ("n",), example='{"intent":"query_gcode_history","n":5}'),
+
+    AgentIntent("query_gcode_upcoming","program", "Query next N G-code lines",
+        "Return the next N G-code lines that are about to be executed.",
+        ("n",), example='{"intent":"query_gcode_upcoming","n":5}'),
+
+    AgentIntent("query_gcode_full",    "program", "Show complete G-code program",
+        "Return the full G-code listing. Programs >30 lines are summarised.",
+        (), example='{"intent":"query_gcode_full"}'),
+
     # QUERY
     AgentIntent("query_status",    "query", "Query machine status",
         "Return full machine state: status, current job, section, queue depth, "
@@ -387,7 +408,7 @@ _QUERY_KEYWORDS: dict[str, list[str]] = {
     "query_status":             ["status", "machine state",
                                   "what is the machine", "what's happening",
                                   "current state", "is the machine"],
-    "query_tool_life":          ["tool life", "life remaining", "wear", "worn",
+    "query_tool_life":          ["tool life", "life remaining",
                                   "how much life", "tool condition", "life pct",
                                   "how worn"],
     "query_tool_detail":        ["radius", "diameter", "shank", "flute",
@@ -397,7 +418,7 @@ _QUERY_KEYWORDS: dict[str, list[str]] = {
                                   "properties of"],
     "query_queue":              ["queue", "queued jobs", "jobs waiting", "backlog",
                                   "what jobs", "next job", "how many jobs"],
-    "query_cycle_time":         ["cycle time", "how long", "machining time",
+    "query_cycle_time":         ["cycle time", "machining time",
                                   "time for job", "estimated time", "how fast"],
     "query_cost":               ["cost", "how much does", "job cost", "total cost",
                                   "price", "usd"],
@@ -407,10 +428,39 @@ _QUERY_KEYWORDS: dict[str, list[str]] = {
                                   "what speed", "what feed"],
     "query_material":           ["material", "what material", "workpiece material",
                                   "what alloy", "what grade"],
-    "query_program":            ["program", "g-code", "gcode", "current program",
-                                  "what program", "which program", "what is loaded"],
-    "query_execution_history":  ["history", "last jobs", "previous jobs", "executed",
-                                  "job history", "past jobs"],
+    # G-code / live execution  (must come BEFORE query_program so more-specific
+    # keywords shadow the generic "g-code" / "gcode" entries)
+    "query_current_part":       ["what part", "which part", "what are you machining",
+                                  "what are you cutting", "current part", "part being",
+                                  "what are you working on", "what job are you",
+                                  "what seed are you", "tell me about the part",
+                                  "what is on the machine"],
+    "query_gcode_current":      ["current g-code", "current gcode", "current line",
+                                  "what line are you", "g-code you are running",
+                                  "gcode you are running", "running right now",
+                                  "what g-code are you", "what gcode are you",
+                                  "current instruction", "executing right now",
+                                  "g-code is running", "gcode is running"],
+    "query_gcode_history":      ["last g-code", "last gcode", "last few g",
+                                  "last few lines", "previously ran", "g-code you ran",
+                                  "gcode history", "g-code history",
+                                  "last 5 g", "last 3 g", "last 10 g",
+                                  "g-codes you executed", "gcodes you executed",
+                                  "what did you run", "last line you ran"],
+    "query_gcode_upcoming":     ["next g-code", "next gcode", "next line",
+                                  "next few g", "next few lines", "upcoming g",
+                                  "about to execute", "about to run",
+                                  "going to run", "going to execute",
+                                  "next 5 g", "next 3 g", "what comes next",
+                                  "what is next to run"],
+    "query_gcode_full":         ["g-code of the part", "gcode of the part",
+                                  "show me the g-code", "full g-code", "all g-code",
+                                  "complete g-code", "entire g-code",
+                                  "list the gcode", "g-code for the part",
+                                  "gcode for the part"],
+    "query_program":            ["what program", "which program", "what is loaded",
+                                  "what program is loaded"],
+    "query_execution_history":  ["last jobs", "previous jobs", "job history", "past jobs"],
     "query_error_log":          ["error log", "fault", "alarms", "error history",
                                   "what errors", "what went wrong"],
 }
@@ -720,6 +770,133 @@ class IntentExecutor:
                 f"  └─ Status         : {status}",
             ]
         return {"intent": "query_tool_detail", "result": "\n".join(lines), "raw": tools}
+
+    # ── G-code / live-execution handlers (require self._msim) ─────────────
+
+    def _do_query_current_part(self, p: dict) -> dict:
+        msim = self._msim
+        if msim is None or getattr(msim, "current_job", None) is None:
+            result = f"No part on machine {self._agent.machine_id} — machine is idle."
+            return {"intent": "query_current_part", "result": result, "raw": {}}
+        job    = msim.current_job
+        cursor = getattr(msim, "gcode_cursor", 0)
+        total  = len(getattr(msim, "gcode_lines", []))
+        pct    = (cursor / total * 100) if total else 0.0
+        bar    = "█" * int(pct / 5) + "░" * (20 - int(pct / 5))
+        result = (
+            f"Part on machine {self._agent.machine_id}:\n"
+            f"  Seed          : {getattr(job, 'seed', '?')}\n"
+            f"  Job ID        : {getattr(job, 'job_id', '?')}\n"
+            f"  Material      : {getattr(job, 'material', '?')}\n"
+            f"  Tool in use   : {getattr(job, 'tool_id_used', '?')}  "
+            f"Ø{getattr(job, 'tool_diameter_used', 0):.0f}mm\n"
+            f"  Section       : {self._agent.current_section or '—'}\n"
+            f"  Sections done : {list(self._agent.completed_sections)}\n"
+            f"  Progress      : line {cursor}/{total}  [{bar}] {pct:.1f}%\n"
+            f"  Est. time     : {getattr(job, 'estimated_time_s', 0)/60:.1f} min"
+        )
+        return {"intent": "query_current_part", "result": result, "raw": {}}
+
+    def _do_query_gcode_current(self, p: dict) -> dict:
+        msim   = self._msim
+        if msim is None:
+            return {"intent": "query_gcode_current",
+                    "result": "G-code state not available — no simulation context.",
+                    "raw": {}}
+        lines  = getattr(msim, "gcode_lines", [])
+        cursor = getattr(msim, "gcode_cursor", 0)
+        if not lines:
+            result = "No G-code loaded."
+        elif cursor >= len(lines):
+            result = f"Cursor past end of program (line {cursor}/{len(lines)})."
+        else:
+            cur  = lines[cursor].strip()
+            prev = lines[cursor - 1].strip() if cursor > 0 else "—"
+            result = (
+                f"Current G-code — {self._agent.machine_id}  "
+                f"(line {cursor + 1} of {len(lines)}):\n"
+                f"  executing: [{cursor:>4}] {cur}\n"
+                f"  previous : [{cursor - 1:>4}] {prev}"
+            )
+        return {"intent": "query_gcode_current", "result": result, "raw": {}}
+
+    def _do_query_gcode_history(self, p: dict) -> dict:
+        n      = int(p.get("n", 5))
+        msim   = self._msim
+        if msim is None:
+            return {"intent": "query_gcode_history",
+                    "result": "G-code state not available.", "raw": {}}
+        lines  = getattr(msim, "gcode_lines", [])
+        cursor = getattr(msim, "gcode_cursor", 0)
+        start  = max(0, cursor - n)
+        window = lines[start:cursor]
+        if not window:
+            result = f"No G-code executed yet (cursor at {cursor})."
+        else:
+            header = (f"Last {len(window)} line(s) executed — "
+                      f"{self._agent.machine_id}  (cursor={cursor}/{len(lines)}):\n")
+            rows   = "\n".join(
+                f"  [{start + i:>4}]{'►' if (start + i) == cursor - 1 else ' '} "
+                f"{ln.strip()}"
+                for i, ln in enumerate(window)
+            )
+            result = header + rows
+        return {"intent": "query_gcode_history", "result": result, "raw": window}
+
+    def _do_query_gcode_upcoming(self, p: dict) -> dict:
+        n      = int(p.get("n", 5))
+        msim   = self._msim
+        if msim is None:
+            return {"intent": "query_gcode_upcoming",
+                    "result": "G-code state not available.", "raw": {}}
+        lines  = getattr(msim, "gcode_lines", [])
+        cursor = getattr(msim, "gcode_cursor", 0)
+        window = lines[cursor: cursor + n]
+        if not window:
+            result = "No upcoming lines — program complete or not started."
+        else:
+            header = (f"Next {len(window)} line(s) to execute — "
+                      f"{self._agent.machine_id}  (cursor={cursor}/{len(lines)}):\n")
+            rows   = "\n".join(
+                f"  [{cursor + i:>4}]{'◄' if i == 0 else ' '} {ln.strip()}"
+                for i, ln in enumerate(window)
+            )
+            result = header + rows
+        return {"intent": "query_gcode_upcoming", "result": result, "raw": window}
+
+    def _do_query_gcode_full(self, p: dict) -> dict:
+        msim   = self._msim
+        if msim is None:
+            return {"intent": "query_gcode_full",
+                    "result": "G-code state not available.", "raw": []}
+        lines  = getattr(msim, "gcode_lines", [])
+        cursor = getattr(msim, "gcode_cursor", 0)
+        job    = getattr(msim, "current_job", None)
+        if not lines:
+            return {"intent": "query_gcode_full", "result": "No G-code loaded.", "raw": []}
+        total = len(lines)
+        seed  = getattr(job, "seed", "?") if job else "?"
+        header = (f"G-code listing — {self._agent.machine_id}  "
+                  f"Seed {seed}  ({total} lines)  cursor={cursor}:\n")
+        MAX = 30
+        if total <= MAX:
+            body = "\n".join(
+                f"  [{i:>4}]{'►' if i == cursor else ' '} {ln.strip()}"
+                for i, ln in enumerate(lines)
+            )
+        else:
+            HEAD, TAIL = 20, 5
+            head_rows = "\n".join(
+                f"  [{i:>4}]{'►' if i == cursor else ' '} {ln.strip()}"
+                for i, ln in enumerate(lines[:HEAD])
+            )
+            tail_rows = "\n".join(
+                f"  [{total - TAIL + i:>4}]"
+                f"{'►' if (total - TAIL + i) == cursor else ' '} {ln.strip()}"
+                for i, ln in enumerate(lines[total - TAIL:])
+            )
+            body = head_rows + f"\n  …  ({total - HEAD - TAIL} lines omitted)  …\n" + tail_rows
+        return {"intent": "query_gcode_full", "result": header + body, "raw": lines}
 
     def _do_unknown(self, p: dict) -> dict:
         return {"intent": "unknown", "result": "Intent not recognised or not executable.", "raw": {}}
