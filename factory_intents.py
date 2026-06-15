@@ -1557,6 +1557,18 @@ class FactoryActionExecutor:
                      f"(seed={seed}, job_id={job_id}) in the queue.")]
 
     def _do_factory_add_to_queue(self, p: dict) -> list[tuple]:
+        """
+        Build and queue a seed for one or all machines.
+
+        Routing:
+          - If ``machine_id`` is present in params → queue to that machine only.
+          - If the operator phrase contains "all machines" / "all four" / "each machine" /
+            "every machine" → queue one copy to every enabled machine.
+          - Otherwise → route via _route_dest_only() (default: shortest queue).
+
+        Jobs are inserted directly into _msim[dest].queue so they are visible to
+        _tick_machine and can start without the scheduler being involved.
+        """
         import threading
         seed     = p.get("seed")
         priority = float(p.get("priority", 1.0))
@@ -1565,44 +1577,116 @@ class FactoryActionExecutor:
             return [("factory",
                      "⚠ Please specify a seed number (e.g. 'add seed 1042 to queue').")]
 
-        lines: list[tuple] = [
-            ("factory",
-             f"Building job for Seed {seed}  priority={priority}…\n"
-             f"Running full CAM pipeline in background."),
-        ]
-
         fa_ref  = self._fa
         app_ref = self._app
 
-        def _build():
-            job = fa_ref.build_job_from_seed(seed)
+        # ── Decide which machines to target ───────────────────────────────
+        question_lower = p.get("question", "").lower()
+        _ALL_PHRASES   = [
+            "all machines", "all four", "every machine",
+            "each machine", "all 4", "all the machines",
+        ]
+        explicit_mid = p.get("machine_id")
+
+        if explicit_mid:
+            # Operator specified one machine by name
+            target_mids = [explicit_mid]
+        elif any(ph in question_lower for ph in _ALL_PHRASES):
+            # Operator wants one copy on every enabled machine
+            target_mids = sorted(
+                mid for mid, ms in (getattr(app_ref, "_msim", None) or {}).items()
+                if ms.enabled
+            )
+            if not target_mids:
+                # Fallback: all agents
+                target_mids = sorted(a.machine_id for a in fa_ref.agents)
+        else:
+            # Default: route to shortest queue via _route_dest_only()
+            if app_ref is not None:
+                dest = app_ref._route_dest_only()
+            else:
+                dest = sorted(a.machine_id for a in fa_ref.agents)[0]
+            target_mids = [dest] if dest else []
+
+        if not target_mids:
+            return [("factory",
+                     "⚠ No enabled machines available — cannot queue the job.")]
+
+        if len(target_mids) > 1:
+            announce = (
+                f"Building Seed {seed} for all {len(target_mids)} machines: "
+                f"{', '.join(target_mids)}  priority={priority}…\n"
+                f"Running CAM pipeline in background for each machine."
+            )
+        else:
+            announce = (
+                f"Building job for Seed {seed}  "
+                f"→ {target_mids[0]}  priority={priority}…\n"
+                f"Running full CAM pipeline in background."
+            )
+
+        lines: list[tuple] = [("factory", announce)]
+
+        # ── Background builder — one thread per target machine ────────────
+        def _build_for(dest_mid: str) -> None:
+            job = fa_ref.build_job_from_seed(seed, machine_id=dest_mid)
             if job is None:
                 if app_ref:
-                    app_ref.post_chat("factory", "factory",
-                        f"⚠ CAM pipeline failed for Seed {seed}. "
+                    app_ref.post_factory_chat(
+                        "factory",
+                        f"⚠ CAM pipeline failed for Seed {seed} → {dest_mid}. "
                         f"Check that the .npy file exists.")
                 return
+
             job.priority = priority
-            fa_ref.enqueue_job(job, seed)
-            # Update ledger
+
+            # ── Route into _msim queue (GUI path) ─────────────────────────
+            msim_map = getattr(app_ref, "_msim", None) if app_ref else None
+            if msim_map and dest_mid in msim_map:
+                msim_map[dest_mid].queue.append(job)
+                q_depth = len(msim_map[dest_mid].queue)
+            else:
+                # Fallback: scheduler queue (non-GUI use)
+                fa_ref.enqueue_job(job, seed)
+                q_depth = len(fa_ref.scheduler.job_queue)
+
+            # ── Ledger write ──────────────────────────────────────────────
             ledger = getattr(fa_ref, "ledger", None)
             if ledger:
+                tick = getattr(fa_ref.scheduler, "tick", 0)
                 ledger.record_queued(
                     job.job_id, seed,
                     job.estimated_time_s,
-                    job.material,
-                    getattr(fa_ref.scheduler, "tick", 0),
+                    getattr(job, "material", "unknown"),
+                    tick,
                 )
+                ledger.record_allocated(
+                    job.job_id, dest_mid, fa_ref.policy, tick)
+
+            # ── Track in _all_jobs ────────────────────────────────────────
+            if app_ref is not None:
+                entry = {
+                    "seed":    seed,
+                    "job_id":  job.job_id,
+                    "lines":   len(job.gcode_lines),
+                    "status":  "queued",
+                    "machine": dest_mid,
+                }
+                app_ref._all_jobs.append(entry)
+
             if app_ref:
-                app_ref.post_chat("factory", "factory",
-                    f"✅ Seed {seed} queued — "
+                app_ref.post_factory_chat(
+                    "factory",
+                    f"✅ Seed {seed} → {dest_mid}  "
                     f"Job {job.job_id[:8]}…  "
                     f"~{job.estimated_time_s/60:.1f} min  "
-                    f"material={job.material}  "
-                    f"priority={priority:.1f}\n"
-                    f"Queue depth: {len(fa_ref.scheduler.job_queue)}")
+                    f"material={getattr(job,'material','?')}  "
+                    f"G-code {len(job.gcode_lines)} lines  "
+                    f"queue depth now: {q_depth}")
 
-        threading.Thread(target=_build, daemon=True).start()
+        for mid in target_mids:
+            threading.Thread(target=_build_for, args=(mid,), daemon=True).start()
+
         return lines
 
     def _do_factory_replace_tool(self, p: dict) -> list[tuple]:
@@ -2343,7 +2427,7 @@ class FactoryActionExecutor:
                         "policy_suggestion": None,
                         "routing_strategy": "round_robin",
                         "routing_reasoning": (
-                            f"Job distribution is {max_j / max(1, min_j):.1f}× "
+                            f"Job distribution is {max_j / max(1, min_j):.1f}x "
                             f"unbalanced ({busiest} vs {idlest}).  "
                             f"Round-robin guarantees each machine receives "
                             f"every 4th job regardless of queue state."
