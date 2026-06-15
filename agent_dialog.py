@@ -719,42 +719,90 @@ class FactoryConversationWindow(tk.Toplevel):
         self._entry.delete(0, "end")
         self.append("operator", txt)
 
-        # ── Three-path routing ────────────────────────────────────────────
+        # ── Intent routing ────────────────────────────────────────────────────
+        #
+        # Step 1 — LLM classifier (when OpenAI is available):
+        #   The static intent catalogue is sent as the system message (cached
+        #   by OpenAI after the first call).  The operator's sentence is the
+        #   user message (~10 tokens).  Returns the exact intent_id, or None.
+        #
+        # Step 2 — Keyword/regex fallback (always available, no network):
+        #   The existing three-path keyword classifier runs when LLM returns None.
+        #
+        # Both paths converge on the same execution code below.
         import threading
+        from typing import Optional as _Opt
+        import config
         from factory_intents import (
             classify_factory_message,
-            extract_factory_parameters,
             classify_factory_action,
+            classify_with_llm,
+            extract_factory_parameters,
+            FACTORY_INTENT_MAP,
         )
 
-        msg_type, intent_id = classify_factory_message(txt)
+        # ── Step 1: LLM classifier ────────────────────────────────────────────
+        llm_intent_id: _Opt[str] = None
+        _llm_client = getattr(getattr(self._app, "fa", None), "_llm_client", None)
+        if _llm_client is not None:
+            # classify_with_llm is fast (50-100 ms warm cache) so we call it
+            # synchronously here before spawning the execution thread.
+            llm_intent_id = classify_with_llm(
+                txt, _llm_client, model=config.OPENAI_MODEL
+            )
 
-        if msg_type == "query":
-            # Path A — direct data query
-            params = extract_factory_parameters(txt, intent_id)
-            threading.Thread(
-                target=self._answer_factory_query,
-                args=(intent_id, params),
-                daemon=True,
-            ).start()
-        else:
-            action_type, action_params = classify_factory_action(txt)
-            if action_type != "unknown":
-                # Path B — deterministic factory action (inc. AI advisory)
+        # ── Step 2: route on LLM result, or fall back to keyword classifier ───
+        if llm_intent_id is not None:
+            # LLM gave a definitive intent_id — route directly.
+            _intent_obj = FACTORY_INTENT_MAP[llm_intent_id]
+            if _intent_obj.category == "query":
+                # Path A — direct data query
+                _params = extract_factory_parameters(txt, llm_intent_id)
                 threading.Thread(
-                    target=self._execute_factory_action,
-                    args=(action_type, action_params),
+                    target=self._answer_factory_query,
+                    args=(llm_intent_id, _params),
                     daemon=True,
                 ).start()
             else:
-                # Path C — unrecognised; fall through to AI advice
-                action_params["question"] = txt
+                # Path B — action or advisory
+                # Keyword extractor provides structured params (seed, machine_id…);
+                # action_type is overridden with the LLM's more accurate choice.
+                _, _action_params = classify_factory_action(txt)
+                _action_params["question"] = txt
                 threading.Thread(
                     target=self._execute_factory_action,
-                    args=("factory_ai_advice", action_params),
+                    args=(llm_intent_id, _action_params),
                     daemon=True,
                 ).start()
+        else:
+            # ── Keyword / regex fallback ──────────────────────────────────────
+            msg_type, intent_id = classify_factory_message(txt)
 
+            if msg_type == "query":
+                # Path A — direct data query
+                params = extract_factory_parameters(txt, intent_id)
+                threading.Thread(
+                    target=self._answer_factory_query,
+                    args=(intent_id, params),
+                    daemon=True,
+                ).start()
+            else:
+                action_type, action_params = classify_factory_action(txt)
+                if action_type != "unknown":
+                    # Path B — deterministic factory action (inc. AI advisory)
+                    threading.Thread(
+                        target=self._execute_factory_action,
+                        args=(action_type, action_params),
+                        daemon=True,
+                    ).start()
+                else:
+                    # Path C — unrecognised; fall through to AI advice
+                    action_params["question"] = txt
+                    threading.Thread(
+                        target=self._execute_factory_action,
+                        args=("factory_ai_advice", action_params),
+                        daemon=True,
+                    ).start()
     def _answer_factory_query(self, intent_id: str, parameters: dict) -> None:
         from factory_intents import FactoryIntentExecutor, FACTORY_INTENT_MAP
 

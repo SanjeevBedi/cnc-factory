@@ -727,6 +727,144 @@ _ADVISORY_MARKERS = [
 ]
 
 
+# ── LLM-based intent classifier ──────────────────────────────────────────────
+#
+# The user's system prompt is stored as a module-level constant so it is built
+# once and reused on every call.  The full intent catalogue is appended, making
+# the combined string ~1 200–1 800 tokens — well over the 1 024-token threshold
+# for OpenAI's automatic prompt caching.  After the first API call the system
+# message prefix is cached; subsequent classifications send only the operator's
+# sentence (~10 tokens) as the user message.
+#
+# Latency (warm cache):  ~50–100 ms
+# Latency (cold / first):  ~300–600 ms
+# Falls back to the keyword classifier silently on any error.
+
+_CLASSIFIER_SYSTEM_PROMPT: Optional[str] = None   # built lazily on first call
+
+
+def _build_classifier_system_prompt() -> str:
+    """
+    Build the static system prompt used by the LLM classifier.
+    Called once; result cached in _CLASSIFIER_SYSTEM_PROMPT.
+
+    Structure (all static — suitable for OpenAI prompt caching):
+      ── User-supplied system prompt (role / task / rules)
+      ── Full FACTORY_INTENT_CATALOGUE as a structured reference list
+      ── Output instruction: return only the intent_id string
+    """
+    lines = [
+        # ── Verbatim system prompt provided by the operator ──
+        "You are an intent classification model for a CNC factory system."
+        " Your task is to read a user\u2019s natural-language sentence and select"
+        " the single best matching intent from a provided list of candidate"
+        " intents. Each intent includes a name, description, and parameters,"
+        " and represents a concrete action, query, or advisory capability"
+        " within the system. The user may phrase requests in many different"
+        " ways, so you must match based on meaning, not keywords. Carefully"
+        " consider whether the user is asking for information (query),"
+        " requesting a change (action), or seeking advice or optimisation"
+        " (advisory). Choose the intent whose purpose most closely aligns"
+        " with the user\u2019s underlying goal. If the request implies"
+        " improvement, recommendations, or analysis beyond simple data"
+        " retrieval, prefer an advisory intent. Return only the selected"
+        " intent_id and ensure it is one of the provided options. Do not"
+        " invent new intents. If the meaning is ambiguous, choose the closest"
+        " match based on overall intent rather than specific wording.",
+        "",
+        # ── Full intent catalogue as reference ──
+        "Available intents:",
+        "",
+    ]
+
+    # Group by category for readability (helps the model reason correctly)
+    for cat in ("query", "action", "advisory"):
+        cat_intents = [i for i in FACTORY_INTENT_CATALOGUE if i.category == cat]
+        if not cat_intents:
+            continue
+        lines.append(f"--- {cat.upper()} INTENTS ---")
+        for intent in cat_intents:
+            lines.append(f"intent_id: {intent.intent_id}")
+            lines.append(f"  category   : {intent.category}")
+            lines.append(f"  label      : {intent.label}")
+            lines.append(f"  description: {intent.description}")
+            if intent.parameters:
+                lines.append(f"  parameters : {', '.join(intent.parameters)}")
+            if intent.example:
+                lines.append(f"  example    : {intent.example}")
+            lines.append("")
+
+    lines += [
+        # ── Output instruction ──
+        "Respond with ONLY the intent_id string — nothing else.",
+        "Do not include quotes, punctuation, or explanation.",
+        "The intent_id must be exactly one of the options listed above.",
+    ]
+    return "\n".join(lines)
+
+
+def classify_with_llm(
+    text: str,
+    llm_client,
+    model: str = "gpt-4o-mini",
+) -> Optional[str]:
+    """
+    Classify *text* into a single factory intent_id using OpenAI.
+
+    The static system message (intent catalogue + rules) is built once and
+    reused on every call so OpenAI can cache it.  Only the operator's
+    sentence changes between calls.
+
+    Returns
+    -------
+    str   — a valid intent_id from FACTORY_INTENT_MAP, or
+    None  — on any error (network, parse, invalid id, timeout).
+             The caller falls back to the keyword classifier.
+    """
+    global _CLASSIFIER_SYSTEM_PROMPT
+    if _CLASSIFIER_SYSTEM_PROMPT is None:
+        _CLASSIFIER_SYSTEM_PROMPT = _build_classifier_system_prompt()
+
+    try:
+        import time as _time
+        t0   = _time.monotonic()
+        comp = llm_client.chat.completions.create(
+            model       = model,
+            max_tokens  = 12,       # intent_id is at most ~35 chars / ~4 tokens
+            temperature = 0.0,      # deterministic — we want exact classification
+            messages    = [
+                {"role": "system", "content": _CLASSIFIER_SYSTEM_PROMPT},
+                {"role": "user",   "content": text},
+            ],
+        )
+        elapsed_ms = (_time.monotonic() - t0) * 1000
+
+        raw       = (comp.choices[0].message.content or "").strip()
+        intent_id = raw.strip('"\' \n')
+
+        if intent_id not in FACTORY_INTENT_MAP:
+            # Model hallucinated or returned prose — treat as a classifier miss
+            return None
+
+        # Attach timing/cache info as a module-level attribute for introspection
+        usage = getattr(comp, "usage", None)
+        ptd   = getattr(usage, "prompt_tokens_details", None) if usage else None
+        cached = getattr(ptd, "cached_tokens", None)
+        classify_with_llm._last_stats = (
+            f"LLM classifier: {intent_id!r}  "
+            f"latency={elapsed_ms:.0f}ms  "
+            + (f"cached={cached}/{getattr(usage,'prompt_tokens',0)} tokens"
+               if cached is not None else "")
+        )
+        return intent_id
+
+    except Exception:
+        return None
+
+# Slot for introspection / test harness
+classify_with_llm._last_stats: str = ""
+
+
 def classify_factory_message(text: str) -> tuple[str, Optional[str]]:
     """
     Classify operator text at the factory level.
