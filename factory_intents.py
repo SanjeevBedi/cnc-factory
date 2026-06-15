@@ -550,7 +550,17 @@ class FactoryLedger:
 #  PART 3 — MESSAGE CLASSIFICATION (mirrors agent_intents.py approach)
 # ══════════════════════════════════════════════════════════════════════════════
 
-_MACHINE_ID_RE = _re.compile(r'\b(M0[1-4])\b', _re.IGNORECASE)
+# Matches M01–M04 AND the shorthand M1–M4 (operator convenience).
+# The normalise_machine_id() helper below always returns the canonical M0x form.
+_MACHINE_ID_RE = _re.compile(r'\bM(0?[1-4])\b', _re.IGNORECASE)
+
+
+def _normalise_mid(raw: str) -> str:
+    """'M2' → 'M02',  'M02' → 'M02',  'm3' → 'M03'  etc."""
+    raw = raw.upper()   # e.g. 'm2' → 'M2'
+    # strip the leading M, pad the digit to 2 chars, reattach
+    digit = raw[1:]     # '2' or '02'
+    return "M" + digit.zfill(2)
 _SEED_RE        = _re.compile(r'\bseed\s*(\d+)\b', _re.IGNORECASE)
 _TOOL_ID_RE     = _re.compile(r'\bT(\d{1,2})\b',  _re.IGNORECASE)
 _N_RE           = _re.compile(r'\blast\s*(\d+)\b|\b(\d+)\s+(?:jobs?|parts?|events?)\b',
@@ -805,10 +815,10 @@ def classify_factory_action(text: str) -> tuple[str, dict]:
     lower  = text.lower()
     params: dict = {}
 
-    # Extract machine ID
+    # Extract machine ID (accepts M1–M4 and M01–M04; always stores as M0x)
     m = _MACHINE_ID_RE.search(text)
     if m:
-        params["machine_id"] = m.group(1).upper()
+        params["machine_id"] = _normalise_mid("M" + m.group(1))
 
     # Extract seed
     s = _SEED_RE.search(text)
@@ -848,7 +858,7 @@ def extract_factory_parameters(text: str, intent_id: str) -> dict:
 
     m = _MACHINE_ID_RE.search(text)
     if m:
-        params["machine_id"] = m.group(1).upper()
+        params["machine_id"] = _normalise_mid("M" + m.group(1))
 
     s = _SEED_RE.search(text)
     if s:
