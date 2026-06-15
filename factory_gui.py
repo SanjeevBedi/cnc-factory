@@ -1533,11 +1533,36 @@ class FactoryGUI(tk.Tk):
             if _ag2:
                 _tr2 = _ag2.tool_crib.get(tool_id)
                 if _tr2:
+                    # ── Compute average W/D ratio from toolpath faces ───────
+                    # width_mm = narrowest dimension of each active face's
+                    # safe_region bounding box; ratio = width / tool_diameter.
+                    _tp   = getattr(job, "toolpath_result", None)
+                    _wds  = []
+                    if _tp and _tr2.diameter_mm > 0:
+                        for _ft in getattr(_tp, "faces", []):
+                            if getattr(_ft, "n_passes", 0) == 0:
+                                continue
+                            _sr = getattr(_ft, "safe_region", None)
+                            if _sr is not None:
+                                try:
+                                    _b  = _sr.bounds
+                                    _fw = min(_b[2] - _b[0], _b[3] - _b[1])
+                                    if _fw > 0:
+                                        _wds.append(_fw / _tr2.diameter_mm)
+                                except Exception:
+                                    pass
+                    _avg_wd   = sum(_wds) / len(_wds) if _wds else 0.0
+                    # Store on the stats dict so FactoryPanel can display it
+                    stats["wd_ratio"] = round(_avg_wd, 3)
+                    stats["tool_d_mm"] = _tr2.diameter_mm
+                    # ── Record in ledger with W/D data ─────────────────────
                     _ledger.record_tool_event(
                         tick_done, mid, tool_id, "used",
-                        life_pct=_tr2.remaining_life_pct,
-                        diameter_mm=_tr2.diameter_mm,
-                        message=f"Seed {job.seed} completed",
+                        life_pct    = _tr2.remaining_life_pct,
+                        diameter_mm = _tr2.diameter_mm,
+                        message     = f"Seed {job.seed} completed",
+                        width_mm    = (_wds[0] * _tr2.diameter_mm if _wds else 0.0),
+                        wd_ratio    = _avg_wd,
                     )
         # Update status in _all_jobs tracking list
         for entry in self._all_jobs:

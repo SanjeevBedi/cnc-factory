@@ -241,6 +241,17 @@ FACTORY_INTENT_CATALOGUE: list[FactoryIntent] = [
         example='{"intent":"factory_set_policy","policy":"best_finish"}',
     ),
 
+    # ── QUERY — detailed machining analysis ─────────────────────────────────
+    FactoryIntent(
+        "factory_machining_stats", "query",
+        "Machining statistics for a seed",
+        "Run the full CAM pipeline dry-run on a seed and return per-face "
+        "statistics: feature width, tool selected, width/diameter ratio, "
+        "passes, estimated time, path length — across one or all machines.",
+        ("seed", "machine_id"),
+        example='{"intent":"factory_machining_stats","seed":1042,"machine_id":"M02"}',
+    ),
+
     # ── ADVISORY — AI analysis ─────────────────────────────────────────────────
     FactoryIntent(
         "factory_scheduling_advice", "advisory",
@@ -261,6 +272,27 @@ FACTORY_INTENT_CATALOGUE: list[FactoryIntent] = [
         ("question",),
         example='{"intent":"factory_ai_advice",'
                 '"question":"how do I reduce idle time on M03?"}',
+    ),
+    FactoryIntent(
+        "factory_tool_optimisation", "advisory",
+        "Optimal tool selection analysis",
+        "Aggregate width/diameter ratios from all recorded tool-use events, "
+        "bucket by ratio range, then ask OpenAI which tool diameters and "
+        "grades are optimal for each bucket and which tools should be "
+        "stocked in every machine crib for best fleet-wide performance. "
+        "Returns three labelled options (A/B/C); operator chooses one to implement.",
+        ("question",),
+        example='{"intent":"factory_tool_optimisation",'
+                '"question":"which tools should be in all machines?"}',
+    ),
+    FactoryIntent(
+        "factory_implement_tool_option", "action",
+        "Implement a pending tool crib option",
+        "Apply one of the tool crib options (A, B, or C) returned by "
+        "factory_tool_optimisation to all machine cribs in memory. "
+        "Changes are live immediately and discarded on program exit.",
+        ("option_letter",),
+        example='{"intent":"factory_implement_tool_option","option_letter":"A"}',
     ),
 ]
 
@@ -363,11 +395,16 @@ class ToolEvent:
     tick:        int
     machine_id:  str
     tool_id:     str
-    event_type:  str   # "warn" | "stop" | "replace" | "breakage" | "install"
+    event_type:  str   # "warn" | "stop" | "replace" | "breakage" | "install" | "used"
     life_pct:    float = 0.0
     diameter_mm: float = 0.0
     message:     str   = ""
     substitute:  bool  = False   # True if a nearest-dia substitute was used
+    # Width-to-diameter ratio analysis (set when event_type=="used")
+    # width_mm   = narrowest dimension of the feature's safe_region bounding box
+    # wd_ratio   = width_mm / diameter_mm  (>1 → wider than tool; ~1 → tight slot)
+    width_mm:    float = 0.0
+    wd_ratio:    float = 0.0
 
 
 @dataclass
@@ -471,17 +508,21 @@ class FactoryLedger:
     def record_tool_event(self, tick: int, machine_id: str, tool_id: str,
                           event_type: str, life_pct: float = 0.0,
                           diameter_mm: float = 0.0, message: str = "",
-                          substitute: bool = False) -> None:
+                          substitute: bool = False,
+                          width_mm: float = 0.0,
+                          wd_ratio: float = 0.0) -> None:
         self.tool_events.append(ToolEvent(
-            event_id   = str(uuid.uuid4()),
-            tick       = tick,
-            machine_id = machine_id,
-            tool_id    = tool_id,
-            event_type = event_type,
-            life_pct   = life_pct,
+            event_id    = str(uuid.uuid4()),
+            tick        = tick,
+            machine_id  = machine_id,
+            tool_id     = tool_id,
+            event_type  = event_type,
+            life_pct    = life_pct,
             diameter_mm = diameter_mm,
-            message    = message,
-            substitute = substitute,
+            message     = message,
+            substitute  = substitute,
+            width_mm    = width_mm,
+            wd_ratio    = wd_ratio,
         ))
 
     # ── Idle tracking ──────────────────────────────────────────────────────────
@@ -595,6 +636,8 @@ _FACTORY_ACTION_SIGNALS = [
     "optimize", "improve", "recommendation",
     "why is", "how can", "how do",                      # advisory questions
     "what should", "suggest", "tell me how",
+    "compute", "calculate", "run stats", "run analysis", # compute actions
+    "implement", "apply option", "go with",             # option implementation
 ]
 
 # Keyword table for factory queries (ordered — most specific first)
@@ -620,6 +663,14 @@ _FACTORY_QUERY_KEYWORDS: dict[str, list[str]] = {
         "all tool changes", "tool breakage", "tool replacements",
         "tool log", "tools changed", "tools replaced",
         "tool usage across", "tool wear history",
+    ],
+    "factory_machining_stats": [
+        "machining stats", "machining statistics", "compute stats",
+        "analyse seed", "analyze seed", "stats for seed",
+        "statistics for seed", "tool usage for seed", "per face",
+        "feature analysis", "which tool for seed", "tool selection for",
+        "time breakdown", "face breakdown", "pass breakdown",
+        "compute statistics", "run on machine",
     ],
     "factory_idle_time": [
         "idle time", "how long idle", "machine idle",
@@ -693,19 +744,21 @@ def classify_factory_message(text: str) -> tuple[str, Optional[str]]:
     """
     lower = text.lower()
 
-    # 0. Complexity guard: messages >12 words containing advisory markers
-    #    are strategic even when they mention query keywords like "idle time".
-    if len(text.split()) > 12:
-        for marker in _ADVISORY_MARKERS:
-            if marker in lower:
-                return ("action", None)
+    # 0. Advisory-marker guard — runs before phrase scan so "idle time is 20%,
+    #    not good, can we look at scheduling?" is treated as advisory even
+    #    though it contains the query keyword "idle time".
+    #    Rule: if ANY advisory marker is present, treat as action regardless
+    #    of message length.
+    for marker in _ADVISORY_MARKERS:
+        if marker in lower:
+            return ("action", None)
 
     # 1. Action-signal words short-circuit
     for sig in _FACTORY_ACTION_SIGNALS:
         if sig in lower:
             return ("action", None)
 
-    # 2. Phrase scan
+    # 2. Phrase scan (only reached when no advisory markers were found)
     for intent_id, keywords in _FACTORY_QUERY_KEYWORDS.items():
         for kw in keywords:
             if kw in lower:
@@ -796,6 +849,24 @@ _FACTORY_ACTION_PATTERNS: list[tuple[str, list[str]]] = [
         "scheduling strategy", "best scheduling",
         "not good", "can we look at how", "what is the best way",
     ]),
+    ("factory_machining_stats", [
+        "compute statistics on machining", "compute stats for",
+        "run stats on seed", "analyse machining of", "analyze machining of",
+        "statistics on seed", "machining analysis for",
+    ]),
+    ("factory_implement_tool_option", [
+        "implement option", "apply option", "use option",
+        "choose option", "go with option", "select option",
+        "activate option", "install option",
+    ]),
+    ("factory_tool_optimisation", [
+        "best tool", "optimal tool", "tool optimis", "tool optimiz",
+        "which tool", "tool recommendation", "tool for all machines",
+        "tool crib optimis", "tool crib optimiz", "width diameter",
+        "wd ratio", "feature ratio", "diameter ratio",
+        "best tools to include", "tools for all machines",
+        "reduced machining time", "improve tool",
+    ]),
     ("factory_ai_advice", [
         "advise", "advice", "analyse", "analyze",
         "optimise", "optimize", "improve",
@@ -840,6 +911,11 @@ def classify_factory_action(text: str) -> tuple[str, dict]:
         if alias in lower:
             params["policy"] = canonical
             break
+
+    # Extract option letter (A / B / C) for factory_implement_tool_option
+    om = _re.search(r'\boption\s+([A-Ca-c])\b', text)
+    if om:
+        params["option_letter"] = om.group(1).upper()
 
     # Extract question (full text minus any commands) for advisory
     params["question"] = text.strip()
@@ -1486,6 +1562,151 @@ class FactoryIntentExecutor:
             ]
         return {"intent": "factory_policy_comparison",
                 "result": "\n".join(lines), "raw": {}}
+
+    def _do_factory_machining_stats(self, p: dict) -> dict:
+        """
+        Dry-run the CAM pipeline on a seed and return per-face machining
+        statistics including width/diameter ratio, tool selection, estimated
+        time, passes, and path length.
+
+        machine_id specified -> that machine only.
+        No machine_id        -> all four machines, side-by-side comparison.
+        material specified   -> force that material through the pipeline.
+        """
+        seed       = p.get("seed")
+        machine_id = p.get("machine_id")
+        material   = p.get("material")
+
+        if seed is None:
+            return {"intent": "factory_machining_stats",
+                    "result": "⚠ Please specify a seed number (e.g. 'stats for seed 1042').",
+                    "raw": {}}
+
+        target_mids = (
+            [machine_id] if machine_id
+            else sorted(ag.machine_id for ag in self._fa.agents)
+        )
+
+        # Optionally pin material so the user gets stats for their choice
+        import timing_model as _tm
+        _orig_assign = _tm.assign_material
+        if material:
+            _tm.assign_material = lambda: material
+        results: dict = {}
+        try:
+            for mid in target_mids:
+                job = self._fa.build_job_from_seed(seed, machine_id=mid)
+                if job is not None:
+                    results[mid] = job
+        finally:
+            _tm.assign_material = _orig_assign
+
+        if not results:
+            return {"intent": "factory_machining_stats",
+                    "result": f"⚠ CAM pipeline failed for seed {seed}.",
+                    "raw": {}}
+
+        import config as _cfg
+        mat_shown = material or next(iter(results.values())).material
+        lines = [
+            f"Machining Statistics — Seed {seed}  |  Material: {mat_shown}",
+            "═" * 76,
+        ]
+
+        for mid, job in sorted(results.items()):
+            tp    = job.toolpath_result
+            t_dia = job.tool_diameter_used
+            t_id  = job.tool_id_used
+            setup = _cfg.PART_SETUP_TIME_S
+            unc   = _cfg.PART_REMOVAL_TIME_S
+            tot   = job.estimated_time_s + setup + unc
+
+            lines += [
+                "",
+                f"┌─ {mid}   Tool: {t_id} ⌀{t_dia:.0f}mm   Material: {job.material}",
+                f"│  G-code: {len(job.gcode_lines)} lines  "
+                f"setup {setup:.0f}s + mach {job.estimated_time_s:.0f}s "
+                f"+ unclamp {unc:.0f}s = ➔ {tot:.0f}s ({tot/60:.1f} min)",
+                "│",
+                f"│  {'Face':>5}  {'FeatW mm':>8}  {'⌀ mm':>6}  {'W/D':>6}  "
+                f"{'Passes':>7}  {'Step mm':>7}  {'Path mm':>8}  {'Time s':>7}  Entry",
+                "│  " + "─" * 72,
+            ]
+
+            face_data = []
+            for ft in (tp.faces if tp else []):
+                feat_w = 0.0
+                if ft.safe_region is not None:
+                    try:
+                        b = ft.safe_region.bounds
+                        feat_w = min(b[2] - b[0], b[3] - b[1])
+                    except Exception:
+                        pass
+                wd = (feat_w / t_dia) if t_dia > 0 and feat_w > 0 else 0.0
+                face_data.append((ft.face_id, feat_w, wd, ft))
+                if ft.n_passes > 0:
+                    lines.append(
+                        f"│  {ft.face_id:>5}  {feat_w:>8.1f}  {t_dia:>6.1f}  {wd:>6.2f}  "
+                        f"{ft.n_passes:>7}  {ft.stepover_mm:>7.2f}  "
+                        f"{ft.path_length_mm:>8.1f}  {ft.estimated_time_s:>7.1f}  {ft.entry_type}"
+                    )
+
+            active = [(fid, fw, wd, ft) for fid, fw, wd, ft in face_data if ft.n_passes > 0]
+            if active:
+                wds    = [wd for _, _, wd, _ in active if wd > 0]
+                avg_wd = sum(wds) / len(wds) if wds else 0.0
+                lines += [
+                    "│  " + "─" * 72,
+                    f"├─ Active: {len(active)}/{len(face_data)} faces   "
+                    f"W/D  avg={avg_wd:.2f}  "
+                    f"min={min(wds) if wds else 0:.2f}  max={max(wds) if wds else 0:.2f}",
+                    f"└─ Machining: {job.estimated_time_s:.0f}s ({job.estimated_time_s/60:.1f}min)  "
+                    f"Path: {(tp.total_path_length_mm if tp else 0):.0f}mm",
+                ]
+
+        if len(results) > 1:
+            lines += [
+                "",
+                "═" * 76,
+                "Comparison — all machines:",
+                f"  {'Machine':>8}  {'Tool':>5}  {'⌀mm':>5}  {'Faces':>6}  "
+                f"{'Mach s':>7}  {'Total s':>7}  {'AvgW/D':>7}  {'G-lines':>8}",
+                "  " + "─" * 62,
+            ]
+            best = min(results, key=lambda m: results[m].estimated_time_s)
+            for mid, job in sorted(results.items()):
+                tp2 = job.toolpath_result
+                wds2: list = []
+                for ft in (tp2.faces if tp2 else []):
+                    if ft.n_passes > 0 and ft.safe_region is not None:
+                        try:
+                            b2 = ft.safe_region.bounds
+                            fw2 = min(b2[2]-b2[0], b2[3]-b2[1])
+                            if fw2 > 0 and job.tool_diameter_used > 0:
+                                wds2.append(fw2 / job.tool_diameter_used)
+                        except Exception:
+                            pass
+                avg2   = sum(wds2) / len(wds2) if wds2 else 0.0
+                nact2  = sum(1 for f in (tp2.faces if tp2 else []) if f.n_passes > 0)
+                total2 = job.estimated_time_s + _cfg.PART_SETUP_TIME_S + _cfg.PART_REMOVAL_TIME_S
+                tag    = "  ★ fastest" if mid == best else ""
+                lines.append(
+                    f"  {mid:>8}  {job.tool_id_used:>5}  {job.tool_diameter_used:>5.1f}  "
+                    f"{nact2:>6}  {job.estimated_time_s:>7.0f}  {total2:>7.0f}  "
+                    f"{avg2:>7.2f}  {len(job.gcode_lines):>8}{tag}"
+                )
+
+        return {
+            "intent": "factory_machining_stats",
+            "result": "\n".join(lines),
+            "raw": {mid: {
+                "tool_id":     results[mid].tool_id_used,
+                "tool_dia":    results[mid].tool_diameter_used,
+                "material":    results[mid].material,
+                "estimated_s": results[mid].estimated_time_s,
+                "gcode_lines": len(results[mid].gcode_lines),
+            } for mid in results},
+        }
 
     def _do_unknown(self, p: dict) -> dict:
         return {"intent": "unknown",
@@ -2221,149 +2442,196 @@ class FactoryActionExecutor:
         return lines
 
 
-    def _compile_factory_context(self, question: str) -> str:
+    # ── Prompt caching helpers ────────────────────────────────────────────────
+    #
+    # OpenAI automatically caches prompt prefixes ≥ 1024 tokens.
+    # To maximise cache hits we split the context into two parts:
+    #
+    #   system message  — STATIC capabilities + format instructions
+    #                     (identical on every call → cached after first request)
+    #   user message    — DYNAMIC factory state + KPIs + question
+    #                     (changes each call → never cached, always fresh)
+    #
+    # The static system message is ~1 000–1 400 tokens, which crosses the
+    # 1 024-token threshold and becomes cache-eligible on OpenAI's infrastructure.
+    # Cache hits are reported in usage.prompt_tokens_details.cached_tokens
+    # (available in openai-python ≥ 1.40; silently ignored on older versions).
+
+    def _build_static_system_prompt(self) -> str:
         """
-        Build the full context string for the AI prompt.
-        Includes:
-          1. Factory intent catalogue (what the factory can do)
-          2. Machine intent catalogue (what each machine can do)
-          3. FactoryLedger snapshot (history, idle, tool events, KPIs)
-          4. Active policy and scheduler state
-          5. Per-machine live state
-          6. User question
+        Static, never-changing system message.  Always sent first so it
+        accumulates in OpenAI's prompt cache.  Do NOT include live data here.
         """
         from agent_intents import build_system_context
+        parts = [
+            "You are an AI advisor for an autonomous CNC factory with four machines "
+            "(M01, M02, M03, M04).  Your job is to analyse factory state data and "
+            "respond with structured JSON recommendations.",
+            "",
+            "=== OUTPUT FORMAT ===",
+            "Always respond with a JSON object containing:",
+            '  "recommendation"    — plain-text summary of what you advise (2–4 sentences)',
+            '  "actions"           — list of intents to execute (may be empty [])',
+            '  "policy_suggestion" — scheduling policy name, or null',
+            '  "routing_strategy"  — null | "round_robin" | "random" | "shortest_queue"',
+            '                        Set when job distribution is unbalanced.',
+            '  "routing_reasoning" — one sentence explaining the routing choice',
+            '  "reasoning"         — overall explanation (2–3 sentences)',
+            "Do NOT include prose outside the JSON object.",
+            "",
+            build_factory_context_block(),
+            "",
+            build_system_context("M01…M04", include_examples=False),
+        ]
+        return "\n".join(parts)
 
-        sections = []
+    def _build_dynamic_user_context(self, question: str) -> str:
+        """
+        Dynamic factory snapshot — changes every call so it is NEVER cached.
+        Kept small to reduce token spend on the un-cached portion.
+        """
+        kpis = self._fa.get_production_kpis()
+        tick = getattr(self._fa.scheduler, "tick", 0)
+        t_s  = getattr(self._fa.scheduler, "t_real_s", 0.0)
 
-        # 1. Factory capabilities
-        sections.append(build_factory_context_block())
-
-        # 2. Machine capabilities (abbreviated — one block covers all machines)
-        sections.append(build_system_context("M01…M04", include_examples=False))
-
-        # 3. KPIs and factory state
-        kpis  = self._fa.get_production_kpis()
-        tick  = getattr(self._fa.scheduler, "tick", 0)
-        t_s   = getattr(self._fa.scheduler, "t_real_s", 0.0)
-        state_lines = [
-            "=== CURRENT FACTORY STATE ===",
-            f"Tick: {tick}  Sim-time: {t_s/60:.1f} min  Policy: {self._fa.policy}",
-            f"LLM: {'openai' if self._fa._use_llm else 'rule-based fallback'}",
+        parts = [
+            f"=== LIVE FACTORY STATE  tick={tick}  sim={t_s/60:.1f}min  policy={self._fa.policy} ===",
             "",
             "KPIs:",
-            f"  Machines running          : {kpis['machines_running']}",
-            f"  Machines idle             : {kpis['machines_idle']}",
-            f"  Machines stopped          : {kpis['machines_stopped']}",
-            f"  Jobs completed            : {kpis['total_jobs_completed']}",
-            f"  Jobs in rework            : {kpis['rework_queue_depth']}",
-            f"  Jobs in queue             : {kpis['scheduler_queue_depth']}",
-            f"  Total errors processed    : {kpis['total_errors_processed']}",
-            f"  Total tools replaced      : {kpis['total_tools_replaced']}",
-            f"  Avg tool life             : {kpis['avg_tool_life_pct']:.1f}%",
+            f"  running={kpis['machines_running']}  idle={kpis['machines_idle']}  "
+            f"stopped={kpis['machines_stopped']}",
+            f"  completed={kpis['total_jobs_completed']}  rework={kpis['rework_queue_depth']}  "
+            f"queue={kpis['scheduler_queue_depth']}",
+            f"  errors={kpis['total_errors_processed']}  tools_replaced={kpis['total_tools_replaced']}  "
+            f"avg_tool_life={kpis['avg_tool_life_pct']:.1f}%",
+            "",
+            "Machines:",
         ]
-        sections.append("\n".join(state_lines))
-
-        # 4. Per-machine state
-        machine_lines = ["=== PER-MACHINE STATE ==="]
         for ag in self._fa.agents:
             s     = ag.get_state()
             tools = ag.tool_crib.state_list()
-            machine_lines += [
-                f"{ag.machine_id}  status={ag.status}  "
-                f"queue={s['queue_depth']}  rework={s['rework_depth']}",
-                f"  Tool crib:",
-            ]
-            for t in tools:
-                machine_lines.append(
-                    f"    {t['tool_id']}  Ø{t['diameter_mm']:.0f}mm  "
-                    f"life={t['remaining_life_pct']:.1f}%  "
-                    f"{'STOP' if t['needs_replacement'] else 'OK'}"
-                )
-        sections.append("\n".join(machine_lines))
+            crib  = "  ".join(
+                f"{t['tool_id']}⌀{t['diameter_mm']:.0f}={t['remaining_life_pct']:.0f}%"
+                + ("⛔" if t["needs_replacement"] else "")
+                for t in tools
+            )
+            parts.append(
+                f"  {ag.machine_id}  {ag.status:<22s}  "
+                f"q={s['queue_depth']}  crib: {crib}"
+            )
 
-        # 5. Recent tool events (last 10)
-        recent_tools = self._ledger.tool_events[-10:]
+        # Recent tool events
+        recent_tools = self._ledger.tool_events[-8:]
         if recent_tools:
-            tool_lines = ["=== RECENT TOOL EVENTS ==="]
+            parts.append("")
+            parts.append("Recent tool events:")
             for ev in recent_tools:
-                tool_lines.append(
+                wd_str = f"  W/D={ev.wd_ratio:.2f}" if ev.wd_ratio > 0 else ""
+                parts.append(
                     f"  [{ev.tick}] {ev.machine_id} {ev.tool_id} "
-                    f"{ev.event_type} life={ev.life_pct:.1f}%"
+                    f"{ev.event_type} life={ev.life_pct:.0f}%{wd_str}"
                 )
-            sections.append("\n".join(tool_lines))
 
-        # 6. Recent policy changes
-        if self._ledger.policy_changes:
-            pol_lines = ["=== POLICY HISTORY ==="]
-            for pc in self._ledger.policy_changes[-5:]:
-                pol_lines.append(
-                    f"  [{pc.tick}] {pc.old_policy} → {pc.new_policy}  ({pc.reason})"
-                )
-            sections.append("\n".join(pol_lines))
-
-        # 7. Idle summary
-        idle_sum = self._ledger.idle_summary()
+        # Idle summary
+        idle_sum = self._ledger.idle_summary(current_tick=tick)
         if idle_sum:
-            idle_lines = ["=== IDLE TIME SUMMARY ==="]
+            parts.append("")
+            parts.append("Idle summary:")
             for mid, d in sorted(idle_sum.items()):
-                idle_pct = (d["total_idle_ticks"] / tick * 100) if tick > 0 else 0.0
-                idle_lines.append(
-                    f"  {mid}  idle={idle_pct:.1f}%  "
-                    f"periods={d['n_idle_periods']}  "
-                    f"longest={d['longest_streak']} ticks"
+                pct = (d["total_idle_ticks"] / tick * 100) if tick > 0 else 0.0
+                parts.append(
+                    f"  {mid}  idle={pct:.1f}%  periods={d['n_idle_periods']}  "
+                    f"longest={d['longest_streak']}ticks"
                 )
-            sections.append("\n".join(idle_lines))
 
-        # 8. Completed parts summary
-        done = self._ledger.completed_parts(5)
-        if done:
-            done_lines = ["=== RECENTLY COMPLETED PARTS (last 5) ==="]
-            for r in done:
-                done_lines.append(
-                    f"  Seed {r.seed}  {r.machine_id}  {r.material}  "
-                    f"est={r.estimated_time_s/60:.1f}min  "
-                    f"act={r.actual_time_s/60:.1f}min  "
-                    f"errors={r.error_count}"
+        # Policy changes
+        if self._ledger.policy_changes:
+            parts.append("")
+            parts.append("Policy history:")
+            for pc in self._ledger.policy_changes[-3:]:
+                parts.append(f"  [{pc.tick}] {pc.old_policy} → {pc.new_policy}")
+
+        # Completed parts (last 5)
+        gui_done = list(getattr(getattr(self, "_app", None), "_completed_parts", []))
+        if gui_done:
+            parts.append("")
+            parts.append(f"Completed parts (last 5 of {len(gui_done)}):")
+            for cp in gui_done[-5:]:
+                parts.append(
+                    f"  Seed {cp.get('seed','?')} on {cp.get('machine','?')}  "
+                    f"mach={cp.get('machining_s',0):.0f}s  total={cp.get('total_s',0):.0f}s"
                 )
-            sections.append("\n".join(done_lines))
 
-        # 9. The user's question
-        sections.append(f"=== OPERATOR QUESTION ===\n{question}")
+        parts += [
+            "",
+            f"=== OPERATOR QUESTION ===",
+            question,
+        ]
+        return "\n".join(parts)
 
-        return "\n\n".join(sections)
+    def _compile_factory_context(self, question: str) -> str:
+        """
+        Legacy single-string context builder kept for non-OpenAI paths
+        (fallback advice, logging).  For OpenAI calls use
+        _build_static_system_prompt() + _build_dynamic_user_context().
+        """
+        return self._build_static_system_prompt() + "\n\n" + self._build_dynamic_user_context(question)
 
     def _call_openai(self, context: str, question: str) -> dict:
-        """Call the OpenAI API and parse the structured JSON response."""
-        import json
-        system_prompt = (
-            "You are an AI advisor for a CNC factory.  "
-            "Analyse the provided factory state, ledger, and intent catalogues, "
-            "then respond with a JSON object that specifies:\n"
-            "  recommendation    — plain-text advice (2-4 sentences)\n"
-            "  actions           — list of specific intents to execute\n"
-            "  policy_suggestion — recommended scheduling policy or null\n"
-            "  routing_strategy  — one of: null | \"round_robin\" | \"random\" | \"shortest_queue\"\n"
-            "                      Set this when job distribution is unbalanced across machines.\n"
-            "  routing_reasoning — why this routing strategy will help (one sentence)\n"
-            "  reasoning         — overall explanation\n"
-            "Do not include prose outside the JSON object."
-        )
+        """
+        Call OpenAI with a prompt-cache-friendly split:
+          system message = static capabilities (cached after first call)
+          user   message = live state + question (fresh each call)
+
+        Reports cache savings when the openai-python SDK exposes them
+        (requires openai >= 1.40; gracefully degrades on older versions).
+        """
+        import json, time as _time
+
+        system_msg = self._build_static_system_prompt()
+        user_msg   = self._build_dynamic_user_context(question)
+
+        t0 = _time.monotonic()
         try:
             comp = self._fa._llm_client.chat.completions.create(
                 model       = config.OPENAI_MODEL,
                 max_tokens  = 800,
                 temperature = 0.3,
                 messages    = [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user",   "content": context},
+                    {"role": "system", "content": system_msg},
+                    {"role": "user",   "content": user_msg},
                 ],
             )
-            raw  = comp.choices[0].message.content or "{}"
+            elapsed_ms = (_time.monotonic() - t0) * 1000
+
+            raw   = comp.choices[0].message.content or "{}"
             clean = (raw.strip()
                        .lstrip("```json").lstrip("```")
                        .rstrip("```").strip())
-            return json.loads(clean)
+            result = json.loads(clean)
+
+            # ── Cache statistics (openai >= 1.40) ────────────────────────
+            usage = getattr(comp, "usage", None)
+            if usage:
+                ptd           = getattr(usage, "prompt_tokens_details", None)
+                cached_tokens = getattr(ptd, "cached_tokens", None)
+                prompt_tokens = getattr(usage, "prompt_tokens", 0)
+                comp_tokens   = getattr(usage, "completion_tokens", 0)
+                total_tokens  = getattr(usage, "total_tokens", 0)
+                cache_info = (
+                    f"  cached={cached_tokens}/{prompt_tokens} prompt tokens  "
+                    f"({cached_tokens/max(1,prompt_tokens)*100:.0f}% hit)"
+                    if cached_tokens is not None else
+                    "  (cache stats unavailable — upgrade openai-python to ≥1.40)"
+                )
+                result["_cache_stats"] = (
+                    f"tokens: prompt={prompt_tokens} cached={'?' if cached_tokens is None else cached_tokens} "
+                    f"completion={comp_tokens} total={total_tokens}  "
+                    f"latency={elapsed_ms:.0f}ms{cache_info}"
+                )
+
+            return result
+
         except Exception as exc:
             return {
                 "recommendation": f"[OpenAI error: {exc}]",
@@ -2461,6 +2729,482 @@ class FactoryActionExecutor:
             "policy_suggestion": None,
             "reasoning": "[Rule-based fallback — connect OpenAI for full analysis]",
         }
+
+    def _do_factory_tool_optimisation(self, p: dict) -> list[tuple]:
+        """
+        Demo arc — mirrors the routing hotswap:
+
+          1. Compile width/diameter (W/D) ratio stats from all ledger tool-use events.
+          2. Send current crib + W/D distribution to OpenAI.
+          3. OpenAI returns three labelled options (A / B / C) — each a complete
+             delta (add / replace / remove) against the current crib.
+          4. Options are displayed and stored in  app._pending_tool_options.
+          5. Operator types "implement option A"  →  _do_factory_implement_tool_option()
+             patches every machine's in-memory ToolCrib objects.
+          6. On program exit the mutations are garbage-collected.  No files touched.
+        """
+        import json, copy as _copy
+        from collections import defaultdict, Counter
+
+        question = p.get("question",
+                         "Which tools should be in all machines for reduced machining time?")
+        app_ref  = self._app
+
+        # ── 1. Compile W/D ratio distribution ──────────────────────────────────
+        use_events = [
+            ev for ev in self._ledger.tool_events
+            if ev.event_type == "used" and ev.wd_ratio > 0
+        ]
+        gui_done = list(getattr(app_ref, "_completed_parts", []))
+
+        # Bucket edges and human labels
+        EDGES  = [0.0, 1.5, 3.0, 6.0, float("inf")]
+        LABELS = ["W/D < 1.5  (tight slot / hole)",
+                  "W/D 1.5–3  (medium pocket)",
+                  "W/D 3–6    (wide pocket)",
+                  "W/D > 6    (large face)"]
+
+        buckets: dict = defaultdict(list)   # bucket_idx → [{tool_id, dia_mm, wd}, …]
+        for ev in use_events:
+            for i, (lo, hi) in enumerate(zip(EDGES, EDGES[1:])):
+                if lo <= ev.wd_ratio < hi:
+                    buckets[i].append({"tool_id": ev.tool_id,
+                                       "dia_mm":  ev.diameter_mm,
+                                       "wd":      ev.wd_ratio})
+                    break
+
+        # ── 2. Current crib snapshot (all machines) ─────────────────────────────
+        crib_now: list = []
+        for ag in self._fa.agents:
+            for t in ag.tool_crib.state_list():
+                crib_now.append({
+                    "machine":   ag.machine_id,
+                    "tool_id":   t["tool_id"],
+                    "dia_mm":    t["diameter_mm"],
+                    "life_pct":  t["remaining_life_pct"],
+                })
+
+        # ── 3. Build stats summary lines (always shown) ─────────────────────────
+        sum_lines = [
+            "Tool W/D Ratio Distribution:",
+            "═" * 58,
+        ]
+        bucket_summary = []
+        for i, label in enumerate(LABELS):
+            items = buckets.get(i, [])
+            if items:
+                cnt   = Counter(it["tool_id"] for it in items)
+                best  = cnt.most_common(1)[0][0]
+                dias  = [it["dia_mm"] for it in items]
+                avg_d = sum(dias) / len(dias)
+                wds   = [it["wd"] for it in items]
+                avg_w = sum(wds) / len(wds)
+                sum_lines.append(
+                    f"  {label:<30}  {len(items):>5} uses  "
+                    f"most-used: {best} (avg ⌀{avg_d:.0f}mm  avgW/D={avg_w:.2f})"
+                )
+                bucket_summary.append({
+                    "range": label, "n": len(items),
+                    "best_tool": best, "avg_dia": avg_d, "avg_wd": avg_w,
+                    "tool_counts": dict(cnt),
+                })
+            else:
+                sum_lines.append(f"  {label:<30}    (no data)")
+                bucket_summary.append({"range": label, "n": 0})
+
+        sum_lines += [
+            "",
+            "Current tool crib (per machine):",
+        ]
+        seen = set()
+        for e in crib_now:
+            key = (e["tool_id"], e["dia_mm"])
+            if key not in seen:
+                seen.add(key)
+                sum_lines.append(f"  {e['tool_id']:>4}  ⌀{e['dia_mm']:>5.1f}mm")
+
+        out: list[tuple] = [("factory", "\n".join(sum_lines))]
+
+        if not bucket_summary or all(b["n"] == 0 for b in bucket_summary):
+            out.append(("factory",
+                "⚠ No W/D ratio data yet.\n"
+                "  Run 'machining stats for seed <N>' first to generate per-face data,\n"
+                "  then ask again once jobs have completed and tool events are recorded."))
+            return out
+
+        # ── 4. Ask OpenAI for 3 options ─────────────────────────────────────────
+        system_prompt = (
+            "You are a CNC process engineer.  Given width/diameter (W/D) ratio "
+            "statistics from a 4-machine CNC factory and the current tool crib, "
+            "propose exactly THREE alternative tool crib configurations "
+            "(labelled A, B, C) that would reduce overall machining time.\n\n"
+            "Rules:\n"
+            "  • Each option must be a DELTA from the current crib: list only "
+            "    tools to ADD, REPLACE, or REMOVE.\n"
+            "  • Specify realistic CNC tool parameters.\n"
+            "  • Apply changes to ALL machines unless stated otherwise.\n"
+            "  • expected_gain_pct must be a realistic integer (5–35 typical).\n"
+            "  • Keep each option to ≤ 4 changes.\n\n"
+            "Respond with JSON only (no prose outside the object):\n"
+            "{\n"
+            '  "options": {\n'
+            '    "A": {\n'
+            '      "label":            "short name",\n'
+            '      "reasoning":        "one sentence",\n'
+            '      "expected_gain_pct": 12,\n'
+            '      "changes": [\n'
+            '        {"op":"replace","tool_id":"T1","diameter_mm":80.0,'
+            '"n_inserts":6,"shank_length_mm":100.0,'
+            '"max_life_hrs":30.0,"holder_cost_usd":450.0,"consumable_cost_usd":18.0},\n'
+            '        {"op":"add",    "tool_id":"T11","diameter_mm":6.0,'
+            '"n_inserts":2,"shank_length_mm":50.0,'
+            '"max_life_hrs":20.0,"holder_cost_usd":120.0,"consumable_cost_usd":8.0},\n'
+            '        {"op":"remove", "tool_id":"T5"}\n'
+            "      ]\n"
+            "    },\n"
+            '    "B": { ... },\n'
+            '    "C": { ... }\n'
+            "  },\n"
+            '  "recommendation": "A",\n'
+            '  "reasoning": "two sentences"\n'
+            "}"
+        )
+        user_msg = json.dumps({
+            "wd_distribution": bucket_summary,
+            "current_crib":    crib_now,
+            "n_machines":      len(self._fa.agents),
+            "policy":          self._fa.policy,
+            "question":        question,
+        }, indent=2)
+
+        out.append(("factory",
+            "Sending W/D data to OpenAI — requesting 3 tool crib options…"))
+
+        ai_resp = None
+        if self._fa._use_llm:
+            try:
+                import time as _time
+                t0   = _time.monotonic()
+                comp = self._fa._llm_client.chat.completions.create(
+                    model       = config.OPENAI_MODEL,
+                    max_tokens  = 900,
+                    temperature = 0.25,
+                    messages    = [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user",   "content": user_msg},
+                    ],
+                )
+                elapsed = (_time.monotonic() - t0) * 1000
+                raw    = comp.choices[0].message.content or "{}"
+                clean  = raw.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
+                ai_resp = json.loads(clean)
+
+                # Cache stats (openai >= 1.40)
+                usage = getattr(comp, "usage", None)
+                ptd   = getattr(usage, "prompt_tokens_details", None) if usage else None
+                cached = getattr(ptd, "cached_tokens", None)
+                prompt_tok = getattr(usage, "prompt_tokens", 0)
+                cache_note = (
+                    f"  [{cached}/{prompt_tok} tokens cached  latency {elapsed:.0f}ms]"
+                    if cached is not None else
+                    f"  [latency {elapsed:.0f}ms]"
+                )
+                ai_resp["_cache_note"] = cache_note
+            except Exception as exc:
+                out.append(("factory", f"⚠ OpenAI error: {exc}\nFalling back to rule-based options."))
+
+        # ── 5. Rule-based fallback options ─────────────────────────────────────
+        if ai_resp is None:
+            ai_resp = self._rule_based_tool_options(bucket_summary, crib_now)
+
+        # ── 6. Display the three options ────────────────────────────────────────
+        options_raw = ai_resp.get("options", {})
+        rec         = ai_resp.get("recommendation", "A")
+        cache_note  = ai_resp.get("_cache_note", "")
+
+        opt_lines = [
+            "",
+            "OpenAI Tool Crib Options" + cache_note,
+            "═" * 60,
+            f"  Recommendation: Option {rec}",
+            f"  Reasoning: {ai_resp.get('reasoning', '—')}",
+            "",
+        ]
+        for letter, opt in options_raw.items():
+            tag = "  ★ RECOMMENDED" if letter == rec else ""
+            opt_lines += [
+                f"┌── Option {letter}: {opt.get('label','?')} "
+                f"(+{opt.get('expected_gain_pct','?')}% gain){tag}",
+                f"│   {opt.get('reasoning','—')}",
+                "│   Changes vs current crib:",
+            ]
+            for ch in opt.get("changes", []):
+                op  = ch.get("op", "?")
+                tid = ch.get("tool_id", "?")
+                if op == "remove":
+                    opt_lines.append(f"│     ✂  REMOVE  {tid}")
+                elif op == "add":
+                    opt_lines.append(
+                        f"│     ➕ ADD     {tid}  ⌀{ch.get('diameter_mm','?')}mm  "
+                        f"{ch.get('n_inserts','?')} inserts  "
+                        f"life {ch.get('max_life_hrs','?')}h"
+                    )
+                else:  # replace
+                    opt_lines.append(
+                        f"│     🔄 REPLACE {tid} → ⌀{ch.get('diameter_mm','?')}mm  "
+                        f"{ch.get('n_inserts','?')} inserts  "
+                        f"life {ch.get('max_life_hrs','?')}h"
+                    )
+            opt_lines.append("└" + "─" * 55)
+
+        opt_lines += [
+            "",
+            "These options exist in memory only — they will be deleted when the",
+            "program exits.  No config files or tool databases are modified.",
+            "",
+            "To implement: type  'implement option A'  (or B or C)",
+            "To discard:   type  'discard tool options'",
+        ]
+        out.append(("openai" if self._fa._use_llm else "factory",
+                    "\n".join(opt_lines)))
+
+        # ── 7. Store options on app for retrieval by implement handler ──────────
+        if app_ref is not None:
+            app_ref._pending_tool_options  = options_raw
+            app_ref._tool_option_rec       = rec          # AI's recommendation letter
+        return out
+
+    def _rule_based_tool_options(self, bucket_summary: list, crib_now: list) -> dict:
+        """
+        Generate three plausible tool crib options without OpenAI.
+        Logic: identify the most-used W/D range and propose tools
+        optimised for that range across three risk levels.
+        """
+        # Find the busiest bucket
+        busiest = max(bucket_summary, key=lambda b: b.get("n", 0), default={})
+        avg_wd  = busiest.get("avg_wd", 3.0)
+
+        # Heuristic: optimal tool diameter ≈ feature_width / optimal_wd_ratio
+        # For speed: wd ~ 2.0 (half-width engagement)
+        # For quality: wd ~ 1.2 (tight, more passes but better finish)
+        # Balanced: wd ~ 1.6
+
+        # Current max diameter in crib
+        max_dia = max((e["dia_mm"] for e in crib_now), default=50.0)
+
+        def _change(op, tid, dia=None, inserts=2, life=20.0, holder=200.0, cons=10.0, shank=75.0):
+            c = {"op": op, "tool_id": tid}
+            if op != "remove":
+                c.update({"diameter_mm": dia, "n_inserts": inserts,
+                           "shank_length_mm": shank, "max_life_hrs": life,
+                           "holder_cost_usd": holder, "consumable_cost_usd": cons})
+            return c
+
+        options = {
+            "A": {
+                "label":             "High-throughput (speed priority)",
+                "reasoning":         f"Larger tools reduce pass count for W/D avg={avg_wd:.1f}× — best when surface finish is secondary.",
+                "expected_gain_pct": 18,
+                "changes": [
+                    _change("replace", "T1", dia=min(max_dia*1.2, 120), inserts=8, life=28, holder=480, cons=22, shank=80),
+                    _change("replace", "T2", dia=min(max_dia*0.8, 80),  inserts=6, life=25, holder=380, cons=18, shank=75),
+                    _change("add",     "T11", dia=8.0, inserts=2, life=18, holder=110, cons=7, shank=45),
+                ],
+            },
+            "B": {
+                "label":             "Balanced (time + finish)",
+                "reasoning":         "Moderate tool upgrades with one extra small-dia tool for tight-slot coverage.",
+                "expected_gain_pct": 10,
+                "changes": [
+                    _change("replace", "T2", dia=min(max_dia, 60), inserts=6, life=26, holder=360, cons=16, shank=75),
+                    _change("add",     "T11", dia=6.0, inserts=2, life=20, holder=120, cons=8, shank=50),
+                ],
+            },
+            "C": {
+                "label":             "Tool-life priority (fewer replacements)",
+                "reasoning":         "Larger inserts and better grades extend crib life, reducing downtime from tool changes.",
+                "expected_gain_pct": 6,
+                "changes": [
+                    _change("replace", "T3", dia=30.0, inserts=4, life=40, holder=300, cons=14, shank=70),
+                    _change("replace", "T4", dia=12.0, inserts=3, life=35, holder=180, cons=10, shank=55),
+                ],
+            },
+        }
+        return {"options": options, "recommendation": "A",
+                "reasoning": "Rule-based: Option A gives highest throughput gain for your W/D distribution."}
+
+    def _do_factory_implement_tool_option(self, p: dict) -> list[tuple]:
+        """
+        Apply a pending tool crib option (A / B / C) to every machine's
+        in-memory ToolCrib.
+
+        Pattern mirrors _hotswap_routing():
+          • snapshot original cribs → app._original_tool_cribs
+          • apply deltas (add / replace / remove) via ToolCrib API
+          • record as PolicyChange in ledger
+          • no files written; mutations GC-collected on program exit
+        """
+        import copy as _copy
+
+        app_ref = self._app
+        if app_ref is None:
+            return [("factory", "⚠ No app reference — cannot apply option.")]
+
+        # Which option did the operator choose?
+        question = p.get("question", "").upper()
+        option_letter = p.get("option_letter")  # set by classifier if present
+        if not option_letter:
+            for letter in ("A", "B", "C"):
+                if letter in question:
+                    option_letter = letter
+                    break
+        if not option_letter:
+            return [("factory",
+                "⚠ Please specify which option: 'implement option A', B, or C.")]
+
+        pending = getattr(app_ref, "_pending_tool_options", {})
+        if not pending:
+            return [("factory",
+                "⚠ No pending tool options found.\n"
+                "  Ask for tool optimisation first: "
+                "'which tools should we use to reduce machining time?'")]
+
+        opt = pending.get(option_letter)
+        if opt is None:
+            available = ", ".join(sorted(pending.keys()))
+            return [("factory",
+                f"⚠ Option {option_letter!r} not found.  "
+                f"Available: {available}")]
+
+        label   = opt.get("label", option_letter)
+        changes = opt.get("changes", [])
+        gain    = opt.get("expected_gain_pct", "?")
+
+        # ── Snapshot current cribs (for log / audit; real revert = restart) ───
+        original: dict = {}
+        for ag in self._fa.agents:
+            original[ag.machine_id] = {
+                tid: _copy.copy(tr)
+                for tid, tr in ag.tool_crib._tools.items()
+            }
+        if app_ref is not None:
+            app_ref._original_tool_cribs = original
+
+        # ── Apply changes to every machine ────────────────────────────────────
+        from cnc_agent import ToolRecord
+        import config as _cfg
+
+        applied: list[str] = []
+        errors:  list[str] = []
+
+        for ag in self._fa.agents:
+            crib = ag.tool_crib
+            for ch in changes:
+                op  = ch.get("op",      "?")
+                tid = ch.get("tool_id", "?")
+                try:
+                    if op == "remove":
+                        removed = crib.remove_tool(tid)
+                        if removed:
+                            applied.append(f"  ✂  {ag.machine_id}: removed {tid}")
+                        else:
+                            errors.append(f"  ⚠  {ag.machine_id}: {tid} not found (skip remove)")
+
+                    elif op in ("add", "replace"):
+                        if op == "replace":
+                            crib.remove_tool(tid)   # silently ok if missing
+
+                        new_tr = ToolRecord(
+                            tool_id              = tid,
+                            n_inserts            = int(ch.get("n_inserts", 4)),
+                            diameter_mm          = float(ch.get("diameter_mm", 10.0)),
+                            shank_length_mm      = float(ch.get("shank_length_mm", 75.0)),
+                            max_life_hrs         = float(ch.get("max_life_hrs", 20.0)),
+                            remaining_life_hrs   = float(ch.get("max_life_hrs", 20.0)),
+                            holder_cost_usd      = float(ch.get("holder_cost_usd", 200.0)),
+                            consumable_cost_usd  = float(ch.get("consumable_cost_usd", 10.0)),
+                            requires_coolant     = ch.get("requires_coolant", True),
+                        )
+                        crib.add_tool(new_tr)
+                        verb = "replaced" if op == "replace" else "added"
+                        applied.append(
+                            f"  {'🔄' if op=='replace' else '➕'}  {ag.machine_id}: "
+                            f"{verb} {tid} ⌀{new_tr.diameter_mm:.0f}mm"
+                        )
+                    else:
+                        errors.append(f"  ⚠  unknown op {op!r} for {tid} — skipped")
+
+                except Exception as exc:
+                    errors.append(f"  ⚠  {ag.machine_id} / {tid}: {exc}")
+
+        # Deduplicate applied lines (same change × 4 machines → collapse to one)
+        from collections import Counter
+        collapsed: list[str] = []
+        seen_changes: Counter = Counter()
+        for line in applied:
+            # Strip machine prefix to detect duplicates
+            parts = line.split(":", 1)
+            key   = parts[1].strip() if len(parts) == 2 else line
+            seen_changes[key] += 1
+        done_keys: set = set()
+        for line in applied:
+            parts = line.split(":", 1)
+            key   = parts[1].strip() if len(parts) == 2 else line
+            if key not in done_keys:
+                n = seen_changes[key]
+                icon = line.split()[1]
+                collapsed.append(f"  {icon}  ALL machines: {key}  (×{n})")
+                done_keys.add(key)
+
+        # ── Record in ledger ──────────────────────────────────────────────────
+        tick = self._tick()
+        self._ledger.record_policy_change(
+            old_policy = f"tool_crib:default",
+            new_policy = f"tool_crib:option_{option_letter}:{label}",
+            tick       = tick,
+            reason     = f"operator-selected tool option {option_letter}",
+        )
+
+        # Mark active option on app
+        if app_ref is not None:
+            app_ref._active_tool_option        = option_letter
+            app_ref._active_tool_option_label  = label
+
+        # ── Build response ────────────────────────────────────────────────────
+        result_lines = [
+            f"🔧 TOOL CRIB HOTSWAP — Option {option_letter}: {label}",
+            "═" * 58,
+            f"  Expected machining time reduction: ~{gain}%",
+            "",
+            "Changes applied to all machines:",
+        ] + (collapsed if collapsed else ["  (no changes)"])
+
+        if errors:
+            result_lines += ["", "Warnings:"] + errors
+
+        result_lines += [
+            "",
+            "New crib state (all machines):",
+            f"  {'Tool':>5}  {'⌀ mm':>6}  {'Inserts':>8}  {'Life hrs':>9}",
+            "  " + "─" * 34,
+        ]
+        # Show merged crib (same across all machines after apply)
+        sample_ag = self._fa.agents[0] if self._fa.agents else None
+        if sample_ag:
+            for t in sample_ag.tool_crib.state_list():
+                result_lines.append(
+                    f"  {t['tool_id']:>5}  {t['diameter_mm']:>6.1f}  "
+                    f"  {'—':>6}    {t['remaining_life_pct']/100 * sample_ag.tool_crib.get(t['tool_id']).max_life_hrs if sample_ag.tool_crib.get(t['tool_id']) else 0:>7.1f}h"
+                )
+
+        result_lines += [
+            "",
+            "This change lives in memory only.",
+            "It is removed automatically when the program exits.",
+            "Original crib snapshot saved — restart to revert.",
+        ]
+
+        return [("factory", "\n".join(result_lines))]
 
     def _do_unknown(self, p: dict) -> list[tuple]:
         return [("factory",
