@@ -107,6 +107,200 @@ PHASE_LABEL = {
 _SPIN = ("⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷")
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  RESULT REFINEMENT — shared by AgentConversationWindow and
+#                      FactoryConversationWindow
+#
+#  When the operator runs a query (e.g. "list machined parts") the raw result
+#  text is stored on the window as  self._last_result.
+#  A follow-up message ("filter by steel", "sort by time", "only M01")
+#  is detected by is_result_refinement() and routed to refine_result_with_llm()
+#  instead of the normal classifier chain.
+#
+#  Prompt-caching structure:
+#    system  —  static analyst instructions (~500 tokens, cached)
+#    user    —  { previous result text + operator question }  (changes per call)
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Signals that indicate "process / filter / sort the last result"
+_REFINEMENT_SIGNALS: list[str] = [
+    # explicit operations
+    "sort by", "sort the", "order by", "rank by", "rank the",
+    "filter by", "filter the", "filter for",
+    "group by", "group the",
+    "show only", "only show", "just show",
+    "find the", "find all",
+    "count the", "how many of",
+    "extract the",
+    # referential — "those", "them", "that list" etc. with a qualifier
+    "from those", "from that", "from the list", "from the results",
+    "from the above", "in the list", "in those",
+    "of those", "of them", "of that",
+    "which of those", "which ones are",
+    "the ones that", "the ones with",
+    "that are made", "made of",
+    "with material", "whose material",
+    "that have", "that took", "that ran",
+    # material names as stand-alone follow-up
+    "steel", "aluminium", "aluminum", "stainless", "titanium",
+    "abs", "hdpe", "brass", "copper", "cast iron",
+    # column operations
+    "top ", "bottom ", "slowest", "fastest", "longest", "shortest",
+    "highest", "lowest", "average", "total",
+    "by machine", "by seed", "by material", "by time", "by cost",
+    # comparisons
+    "more than", "less than", "greater than", "fewer than",
+    "over ", "under ", "above ", "below ",
+    "took more", "took less", "longer than", "shorter than",
+    # exclusion
+    "exclude", "remove the", "without", "not including",
+]
+
+# Static system prompt — never changes, OpenAI caches it
+_REFINEMENT_SYSTEM_PROMPT: str = (
+    "You are a data analyst assistant for a CNC factory system.\n"
+    "The operator has just run a query that returned production data.\n"
+    "They are now asking a follow-up question to filter, sort, group, or\n"
+    "further analyse that data.\n"
+    "\n"
+    "Your task:\n"
+    "  1. Parse the previous query result (a plain-text table or list).\n"
+    "  2. Apply the operator\'s request exactly.\n"
+    "  3. Return a clean, formatted plain-text answer.\n"
+    "\n"
+    "Rules:\n"
+    "  • Filtering  — show only matching rows; include a count: \'X of Y rows match\'.\n"
+    "  • Sorting    — reorder all rows; label the sort column.\n"
+    "  • Grouping   — show one section per group with a subtotal.\n"
+    "  • Counting   — return the number with a one-line explanation.\n"
+    "  • Averaging  — return the value and the column averaged.\n"
+    "  • Extraction — return only the requested column(s).\n"
+    "  • Preserve the original column headers and spacing where possible.\n"
+    "  • If the request is ambiguous, choose a reasonable interpretation\n"
+    "    and state it in one sentence before the result.\n"
+    "  • Be concise. Do not add prose unrelated to the data.\n"
+    "  • If the previous result contains no data relevant to the request,\n"
+    "    say so clearly in one sentence.\n"
+    "\n"
+    "Examples of operations:\n"
+    "  Filter   — 'just the steel parts'     → rows where material contains steel\n"
+    "  Sort     — 'sort by total time'       → reorder all rows by Total(min) ascending\n"
+    "  Group    — 'group by machine'         → one section per machine ID with subtotals\n"
+    "  Count    — 'how many are aluminium?'  → integer count with material name\n"
+    "  Top N    — 'top 3 longest jobs'       → 3 rows with highest Total(min)\n"
+    "  Average  — 'average machining time'   → mean of Mach(min) column\n"
+    "  Extract  — 'just the seed numbers'    → the Seed column only\n"
+    "  Exclude  — 'without M03 parts'        → filter out rows where machine = M03\n"
+    "  Compare  — 'which took more than 20 min?' → rows where Total(min) > 20\n"
+    "\n"
+    "The data is plain-text: rows separated by newlines, columns by whitespace.\n"
+    "Infer column names from the header row. If no header, use 'column 1' etc.\n"
+    "Return plain text only — no markdown, no code blocks, no extra commentary.\n"
+)
+
+
+def is_result_refinement(text: str, last_result: str) -> bool:
+    """
+    Return True when *text* looks like a follow-up operation on *last_result*.
+
+    Conditions (both must hold):
+      1. last_result is non-empty (there is a previous result to refine).
+      2. The message contains at least one refinement signal OR is short
+         (≤ 8 words) and contains a material name, machine ID, or comparison
+         operator (implying the operator is filtering rather than asking new).
+    """
+    if not last_result:
+        return False
+    lower = text.lower()
+    for sig in _REFINEMENT_SIGNALS:
+        if sig in lower:
+            return True
+    # Short message with a comparison word  (e.g. "just steel", "> 10 min")
+    words = lower.split()
+    if len(words) <= 6:
+        _CMP = [">", "<", ">=", "<=", "==", "=", "not", "no", "only",
+                "just", "above", "below", "more than", "less than"]
+        if any(c in lower for c in _CMP):
+            return True
+    return False
+
+
+def refine_result_with_llm(
+    last_result: str,
+    question: str,
+    llm_client,
+    model: str = "gpt-4o",
+    post_fn = None,        # callable(speaker, text) for streaming updates
+) -> str:
+    """
+    Send *last_result* + *question* to OpenAI and return the processed answer.
+
+    The system prompt is static and cache-eligible.
+    The user message contains the result data + question (changes each call).
+
+    Parameters
+    ----------
+    last_result : str
+        The full text of the previous query result.
+    question : str
+        The operator\'s follow-up / refinement request.
+    llm_client :
+        An openai.OpenAI() client instance.
+    model : str
+        OpenAI model name.
+    post_fn : callable(speaker, text) | None
+        If supplied, intermediate status messages are posted here.
+    Returns
+    -------
+    str  The processed result text, or an error message string.
+    """
+    import time as _time
+
+    if post_fn:
+        post_fn("factory",
+                f"Processing result with OpenAI\u2026\n"
+                f"  Instruction: {question}")
+
+    user_msg = (
+        "Previous query result:\n"
+        "\u2500" * 60 + "\n"
+        + last_result.strip()
+        + "\n" + "\u2500" * 60 + "\n\n"
+        f"Operator instruction: {question}"
+    )
+
+    try:
+        t0   = _time.monotonic()
+        comp = llm_client.chat.completions.create(
+            model       = model,
+            max_tokens  = 1000,
+            temperature = 0.1,
+            messages    = [
+                {"role": "system", "content": _REFINEMENT_SYSTEM_PROMPT},
+                {"role": "user",   "content": user_msg},
+            ],
+        )
+        elapsed_ms = (_time.monotonic() - t0) * 1000
+
+        answer = (comp.choices[0].message.content or "").strip()
+
+        # Cache stats
+        usage  = getattr(comp, "usage", None)
+        ptd    = getattr(usage, "prompt_tokens_details", None) if usage else None
+        cached = getattr(ptd, "cached_tokens", None)
+        p_tok  = getattr(usage, "prompt_tokens",     0)
+        c_tok  = getattr(usage, "completion_tokens", 0)
+        stats  = (
+            f"[tokens: prompt={p_tok}"
+            + (f" cached={cached}" if cached is not None else "")
+            + f" completion={c_tok}  latency={elapsed_ms:.0f}ms]"
+        )
+        return answer + "\n\n" + stats
+
+    except Exception as exc:
+        return f"\u26a0 OpenAI refinement failed: {exc}"
+
+
 class AgentConversationWindow(tk.Toplevel):
     """
     Per-machine conversation window.
@@ -382,6 +576,25 @@ class AgentConversationWindow(tk.Toplevel):
         self._entry.delete(0, "end")
         self.append("operator", txt)
 
+        # ── Follow-up refinement check ────────────────────────────────────
+        # If the operator is refining a previous query result ("sort by steel",
+        # "filter by M01", etc.) send it straight to OpenAI with the last
+        # result as context instead of running the normal classifier.
+        import threading, config
+        _last = getattr(self, "_last_result", "")
+        _llm  = getattr(getattr(self._app, "fa", None), "_llm_client", None)
+        if _llm is not None and is_result_refinement(txt, _last):
+            def _do_refine():
+                def _post(sp, t): self._app.post_chat(self._mid, sp, t)
+                answer = refine_result_with_llm(
+                    _last, txt, _llm,
+                    model   = config.OPENAI_MODEL,
+                    post_fn = _post,
+                )
+                _post("openai", answer)
+            threading.Thread(target=_do_refine, daemon=True).start()
+            return
+
         agent = next((a for a in self._app.fa.agents
                       if a.machine_id == self._mid), None)
         if agent is None:
@@ -509,6 +722,9 @@ class AgentConversationWindow(tk.Toplevel):
         intent_label = INTENT_MAP[intent_id].label if intent_id in INTENT_MAP else intent_id
         post("factory", f"ℹ {intent_label}")
         post("machine", result["result"])
+
+        # Store result so the operator can refine it with a follow-up question
+        self._last_result = result.get("result", "")
 
     def _execute_action(self, agent, action_type: str, parameters: dict) -> None:
         """Execute a deterministic action and post each chat line to the log."""
@@ -779,6 +995,22 @@ class FactoryConversationWindow(tk.Toplevel):
         self._entry.delete(0, "end")
         self.append("operator", txt)
 
+        # ── Follow-up refinement check ────────────────────────────────────
+        import threading, config as _cfg
+        _last = getattr(self, "_last_result", "")
+        _llm  = getattr(getattr(self._app, "fa", None), "_llm_client", None)
+        if _llm is not None and is_result_refinement(txt, _last):
+            def _do_factory_refine():
+                def _post(sp, t): self._app.post_factory_chat(sp, t)
+                answer = refine_result_with_llm(
+                    _last, txt, _llm,
+                    model   = _cfg.OPENAI_MODEL,
+                    post_fn = _post,
+                )
+                _post("openai", answer)
+            threading.Thread(target=_do_factory_refine, daemon=True).start()
+            return
+
         # ── Intent routing ────────────────────────────────────────────────────
         #
         # Step 1 — LLM classifier (when OpenAI is available):
@@ -877,6 +1109,9 @@ class FactoryConversationWindow(tk.Toplevel):
 
         self._app.post_factory_chat("factory", f"ℹ {label}")
         self._app.post_factory_chat("factory", result["result"])
+
+        # Store result so the operator can refine it with a follow-up question
+        self._last_result = result.get("result", "")
 
     def _execute_factory_action(self, action_type: str, parameters: dict) -> None:
         from factory_intents import FactoryActionExecutor

@@ -775,10 +775,14 @@ class IntentExecutor:
         # state_list() returns: tool_id, diameter_mm, shank_length_mm,
         #   remaining_life_hrs, remaining_life_pct, needs_replacement
         # n_inserts is on the ToolRecord itself (not in state_list dict)
+        _diam_hdr  = "\u00d8 mm"
+        _shank_hdr = "Shank mm"
+        _life_hdr  = "Life hrs"
+        _pct_hdr   = "Life %"
         lines = [
             f"Tool crib \u2014 {self._agent.machine_id}  ({len(tools)} tools):",
-            f"  {'ID':<5} {'\u00d8 mm':>6}  {'Shank mm':>9}  "
-            f"{'Life hrs':>9}  {'Life %':>7}  Status",
+            f"  {'ID':<5} {_diam_hdr:>6}  {_shank_hdr:>9}  "
+            f"{_life_hdr:>9}  {_pct_hdr:>7}  Status",
         ]
         lines.append("  " + "\u2500" * 56)
         for t in tools:

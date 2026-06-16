@@ -58,8 +58,10 @@ from toolpath_planner import ToolpathResult, FaceToolpath, ToolpathPass, Waypoin
 
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-_DEFAULT_SPINDLE_RPM_CAP = 4000.0    # simulator default max_rpm
-_DEFAULT_TOOL_LT_MM      = 50.0      # tool stickout length (mm)
+_DEFAULT_SPINDLE_RPM_CAP  = 4000.0   # simulator default max_rpm
+_DEFAULT_TOOL_LT_MM       = 50.0     # tool stickout length (mm)
+_DEFAULT_STOCK_MARGIN_XY  = 10.0     # extra stock around part in XY (mm)
+_DEFAULT_STOCK_MARGIN_Z   = 5.0      # extra stock below deepest cut (mm)
 _COORD_TOL               = 1e-4      # duplicate-position tolerance (mm)
 _COORD_DECIMALS          = 3         # decimal places for X/Y/Z
 _FEED_DECIMALS           = 0         # decimal places for F (integer mm/min)
@@ -200,6 +202,48 @@ def _emit_pass(writer: _Writer, tp: ToolpathPass) -> None:
 
 # ── public API ────────────────────────────────────────────────────────────────
 
+def _stock_bounds(toolpath_result: ToolpathResult,
+                  margin_xy: float = _DEFAULT_STOCK_MARGIN_XY,
+                  margin_z:  float = _DEFAULT_STOCK_MARGIN_Z,
+                  ) -> Optional[tuple]:
+    """
+    Derive stock SIZE and POS from the toolpath waypoints.
+
+    Returns (size_x, size_y, size_z, pos_x, pos_y, pos_z) or None if
+    no cutting waypoints are found.
+
+    Stock top surface is placed at the highest Z seen across all rapid
+    retract moves (≈ clearance height); stock bottom is the lowest cutting
+    Z minus *margin_z*.  XY extents span all waypoints ± *margin_xy*.
+    """
+    all_x, all_y, all_z_cut, all_z_any = [], [], [], []
+    for face in toolpath_result.faces:
+        for tp in face.passes:
+            for wp in tp.waypoints:
+                all_x.append(wp.x)
+                all_y.append(wp.y)
+                all_z_any.append(wp.z)
+                if wp.feed_rate > 0:   # non-rapid = cutting move
+                    all_z_cut.append(wp.z)
+
+    if not all_x:
+        return None
+
+    x_min, x_max = min(all_x), max(all_x)
+    y_min, y_max = min(all_y), max(all_y)
+    z_top   = max(all_z_any)                               # clearance height
+    z_bot   = (min(all_z_cut) if all_z_cut else min(all_z_any)) - margin_z
+
+    size_x = (x_max - x_min) + 2 * margin_xy
+    size_y = (y_max - y_min) + 2 * margin_xy
+    size_z = z_top - z_bot
+    pos_x  = x_min - margin_xy
+    pos_y  = y_min - margin_xy
+    pos_z  = z_bot
+
+    return size_x, size_y, size_z, pos_x, pos_y, pos_z
+
+
 def generate(
     toolpath_result:    ToolpathResult,
     fs_result:          FeedsSpeedsResult,
@@ -262,10 +306,16 @@ def generate(
     w.comment(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     w.blank()
 
-    # ── 2. Tool setup (simulator-specific) ───────────────────────────────────
+    # ── 2. Tool + stock setup (simulator-specific) ───────────────────────────
     w.comment("Tool setup (CNC simulator commands)")
     w.raw(f"TOOL SHAPE {tool_shape}")
     w.raw(f"TOOL SIZE O{tool_Ro:.3f} I{tool_Ri:.3f} L{tool_Lt:.3f}")
+    bounds = _stock_bounds(toolpath_result)
+    if bounds is not None:
+        sx, sy, sz, px, py, pz = bounds
+        w.comment("Stock setup (CNC simulator commands)")
+        w.raw(f"STOCK SIZE X{sx:.3f} Y{sy:.3f} Z{sz:.3f}")
+        w.raw(f"STOCK POS X{px:.3f} Y{py:.3f} Z{pz:.3f}")
     w.blank()
 
     # ── 3. Setup G-codes ──────────────────────────────────────────────────────
