@@ -2380,50 +2380,39 @@ class FactoryActionExecutor:
         if active_strategy == "round_robin":
             best_strategy = "round_robin"
             reason = (
-                f"Round-robin is already active and distributing work evenly "
-                f"({imb:.1f}× imbalance ratio — "
-                + ("good." if imb < 1.5 else "some variance expected with different cycle times.")
+                f"Round-robin is already active ({imb:.1f}× imbalance ratio — "
+                + ("distribution looks good." if imb < 1.5
+                   else "some variance is expected when machines have different cycle times.")
                 + ")"
             )
-            do_hotswap = False
+            action_hint = "  No change needed."
         elif imb >= 2.5:
             best_strategy = "round_robin"
             reason = (
                 f"Job distribution is unbalanced ({imb:.1f}× ratio).  "
-                f"Round-robin immediately shares load evenly across all {n_machines} machines "
+                f"Round-robin will immediately share load evenly across all {n_machines} machines "
                 f"with no latency penalty."
             )
-            do_hotswap = True
+            action_hint = "  → To implement: type  'implement round robin'"
         else:
             best_strategy = active_strategy or "sequential"
             reason = (
                 f"Distribution is balanced ({imb:.1f}× ratio) and utilisation "
                 f"is {overall_util:.0f}%.  Current strategy ({active_strategy}) is appropriate."
             )
-            do_hotswap = False
+            action_hint = "  No change needed."
 
         lines += [
             f"  BEST STRATEGY: {best_strategy.replace('_', '-').upper()}",
             f"  Reason: {reason}",
+            action_hint,
             "",
             "  Also useful regardless of strategy:",
             "    • 'set policy min_time'  — uses largest tools / highest feeds",
             "    • Monitor tool life — tool changes cause unexpected idle gaps",
         ]
 
-        out = [("factory", "\n".join(lines))]
-
-        # Hotswap fires directly when the data justifies it.
-        # No keyword gate — if the analysis shows imbalance, fix it now.
-        if do_hotswap:
-            reasoning = (
-                f"Sequential M01-first routing produced {imb:.1f}× job imbalance.  "
-                f"Round-robin cycles M01→M02→M03→M04 so every machine "
-                f"receives every {n_machines}th job in strict rotation."
-            )
-            out += self._hotswap_routing("round_robin", reasoning)
-
-        return out
+        return [("factory", "\n".join(lines))]
 
     def _do_factory_ai_advice(self, p: dict) -> list[tuple]:
         """
