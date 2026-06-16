@@ -1684,24 +1684,44 @@ class FactoryGUI(tk.Tk):
 
     def _route_dest_only(self) -> "Optional[str]":
         """
-        Choose the destination machine (shortest queue among enabled machines)
-        WITHOUT enqueuing a job.  Call this BEFORE build_job_from_seed() so
-        the correct machine's crib is used for tool selection.
+        Choose the destination machine for the next incoming job.
+        Call this BEFORE build_job_from_seed() so the correct machine's
+        crib is used for tool selection.
         Returns machine_id, or None if all machines are disabled.
 
-        If an AI-dispatched routing override is active (self._routing_fn),
-        it is called instead.  The override is a plain callable
-        (eligible: list[tuple[str,_MachSim]]) -> str and lives only in
-        memory — it vanishes when the program exits.
+        Default strategy — "sequential" (demo starting point):
+          Cycles through enabled machines in sorted order:
+          job 1 → M01, job 2 → M02, job 3 → M03, job 4 → M04,
+          job 5 → M01, …
+          This creates a clear, observable pattern:
+            • every machine gets an equal share of jobs in rotation
+            • because cycle times differ, some machines become idle
+              while others still have queued work → visible in idle-time
+              query → AI recommends round-robin to let faster machines
+              pull extra work dynamically.
+
+        AI hotswap:
+          When _routing_fn is set by FactoryActionExecutor._hotswap_routing()
+          it is called instead.  The override lives only in process memory
+          and is garbage-collected when the program exits.
         """
-        eligible = [(mid, m) for mid, m in self._msim.items() if m.enabled]
+        eligible = sorted(
+            [(mid, m) for mid, m in self._msim.items() if m.enabled],
+            key=lambda x: x[0],          # deterministic: M01 < M02 < M03 < M04
+        )
         if not eligible:
             return None
+
         # AI hotswap hook — set by FactoryActionExecutor at runtime
         fn = getattr(self, "_routing_fn", None)
         if fn is not None:
             return fn(eligible)
-        mid, _ = min(eligible, key=lambda x: len(x[1].queue))
+
+        # Default: sequential cycling  (M01 → M02 → M03 → M04 → M01 → …)
+        # _seq_idx is initialised lazily so __init__ stays clean.
+        idx = getattr(self, "_seq_idx", 0)
+        mid = eligible[idx % len(eligible)][0]
+        self._seq_idx = idx + 1
         return mid
 
     def _route_job(self, job) -> "Optional[str]":

@@ -2265,7 +2265,7 @@ class FactoryActionExecutor:
             "",
             "SECTION 2 — Your current strategy",
             "─" * 58,
-            "  Routing:    Shortest queue among enabled machines",
+            f"  Routing:    {getattr(getattr(self, '_app', None), '_routing_strategy_name', 'sequential')}",
             "  Dispatch:   Immediate (job enters queue as soon as CAM completes)",
             "  Order:      Seed-order (jobs are offered as auto-seed generates them)",
             "",
@@ -2504,17 +2504,21 @@ class FactoryActionExecutor:
         prev_strategy = getattr(app, "_routing_strategy_name", "shortest_queue")
 
         if strategy == "round_robin":
-            state = {"idx": 0}   # stateful counter lives in the closure
+            # Dynamic round-robin: eligible list changes if machines are
+            # disabled at runtime, so we sort it each call and index into
+            # the sorted list.  The closure counter keeps state.
+            state = {"idx": 0}
             def _round_robin_fn(eligible):
-                mids = sorted(mid for mid, _ in eligible)
+                mids = [mid for mid, _ in eligible]   # already sorted by caller
                 mid  = mids[state["idx"] % len(mids)]
                 state["idx"] += 1
                 return mid
             app._routing_fn            = _round_robin_fn
             app._routing_strategy_name = "round_robin"
             strategy_desc = (
-                "Round-robin  "
-                "(job 1→M01, job 2→M02, job 3→M03, job 4→M04, job 5→M01…)"
+                "Round-robin  (dynamic: fastest machines pull extra work — "
+                "job 1→M01, job 2→M02… but if M02 finishes first it gets "
+                "the next job whenever it becomes the head of the cycle)"
             )
         elif strategy == "random":
             import random as _rnd
@@ -2523,10 +2527,18 @@ class FactoryActionExecutor:
             app._routing_fn            = _random_fn
             app._routing_strategy_name = "random"
             strategy_desc = "Random (uniform selection from enabled machines)"
-        else:   # "shortest_queue" or unknown — clear override
+        elif strategy in ("sequential", "shortest_queue", None, ""):
+            # Clear override — revert to the built-in sequential default
             app._routing_fn            = None
-            app._routing_strategy_name = "shortest_queue"
-            strategy_desc = "Shortest queue (least-loaded machine, original default)"
+            app._routing_strategy_name = "sequential"
+            strategy_desc = (
+                "Sequential  (M01 → M02 → M03 → M04 → M01 … fixed rotation, "
+                "ignores current queue depth)"
+            )
+        else:
+            app._routing_fn            = None
+            app._routing_strategy_name = "sequential"
+            strategy_desc = f"Sequential (unknown strategy {strategy!r} — reverted to default)"
 
         import config as _cfg
         from collections import Counter
@@ -2814,42 +2826,89 @@ class FactoryActionExecutor:
                 "reasoning": "Reduce rework by improving surface quality.",
             })
         if "idle" in lower or "schedul" in lower or "routing" in lower:
-            # Check for machine imbalance using completed-parts data
+            # Under the sequential strategy every machine gets an equal
+            # share of jobs, so job-count imbalance won't appear.
+            # Instead detect idle time: if fleet utilisation is low
+            # (machines are idle waiting for the fixed rotation to reach them)
+            # recommend round-robin so faster machines pull extra work.
             gui_done = list(getattr(getattr(self, "_app", None),
                                     "_completed_parts", []))
             from collections import Counter
-            dist = Counter(cp.get("machine", "") for cp in gui_done)
-            if dist:
-                max_j = max(dist.values())
-                min_j = min(dist.values())
-                if max_j > 0 and (max_j / max(1, min_j)) >= 2.5:
+            dist  = Counter(cp.get("machine", "") for cp in gui_done)
+            tick  = self._tick()
+            import config as _cfg2
+            t_tick_s = _cfg2.T_TICK_S
+
+            # Busy ticks per machine
+            busy_map2: dict = {}
+            for cp in gui_done:
+                m2 = cp.get("machine", "")
+                ts = (cp.get("machining_s", 0)
+                      + cp.get("load_s", 0)
+                      + cp.get("unload_s", 0))
+                busy_map2[m2] = busy_map2.get(m2, 0) + ts / t_tick_s
+
+            n_mach2     = max(1, len(self._fa.agents))
+            total_busy2 = sum(busy_map2.values())
+            fleet_util  = (total_busy2 / max(1, tick * n_mach2) * 100) if tick > 0 else 0
+
+            # Job-count imbalance check (still useful if routing is NOT sequential)
+            current_strategy = getattr(
+                getattr(self, "_app", None),
+                "_routing_strategy_name", "sequential"
+            )
+            max_j = max(dist.values()) if dist else 0
+            min_j = min(dist.values()) if dist else 0
+            job_imbalance = (max_j / max(1, min_j)) if min_j > 0 else 1
+
+            # Trigger round-robin if:
+            #  a) Sequential: fleet idle > 25% (fixed rotation wastes capacity)
+            #  b) Any strategy: job distribution is >2.5x skewed
+            trigger_idle     = (current_strategy == "sequential" and fleet_util < 75.0
+                                 and tick > 50 and len(gui_done) > 0)
+            trigger_imbalance = (job_imbalance >= 2.5 and max_j > 0)
+
+            if trigger_idle or trigger_imbalance:
+                if trigger_idle:
+                    reason_str = (
+                        f"Sequential routing allocates jobs in fixed M01→M02→M03→M04 order, "
+                        f"ignoring actual machine speed.  Fleet utilisation is {fleet_util:.0f}%.  "
+                        f"Round-robin lets faster machines pull the next job in the cycle "
+                        f"as soon as they finish, filling idle gaps dynamically."
+                    )
+                    routing_reason = (
+                        f"Sequential strategy leaves fleet at {fleet_util:.0f}% utilisation.  "
+                        f"Round-robin routes each new job to the next machine in a "
+                        f"dynamic cycle so faster machines absorb more work automatically."
+                    )
+                else:
                     busiest = max(dist, key=dist.get)
                     idlest  = min(dist, key=dist.get)
-                    recs.append(
-                        f"Machine distribution is severely unbalanced: {busiest} ran "
-                        f"{max_j} jobs vs {idlest} ran {min_j} jobs.  "
-                        f"Switching to round-robin routing will immediately "
-                        f"balance load across all machines."
+                    reason_str = (
+                        f"Job distribution is unbalanced: {busiest} ran {max_j} jobs vs "
+                        f"{idlest} ran {min_j} jobs ({job_imbalance:.1f}× ratio).  "
+                        f"Round-robin will immediately balance load."
                     )
-                    acts.append({
-                        "target": "factory",
-                        "intent": "factory_set_routing",  # logical only — hotswap below
-                        "parameters": {"routing_strategy": "round_robin"},
-                        "reasoning": "Eliminates job starvation on under-utilised machines.",
-                    })
-                    return {
-                        "recommendation": "  ".join(recs),
-                        "actions": acts,
-                        "policy_suggestion": None,
-                        "routing_strategy": "round_robin",
-                        "routing_reasoning": (
-                            f"Job distribution is {max_j / max(1, min_j):.1f}x "
-                            f"unbalanced ({busiest} vs {idlest}).  "
-                            f"Round-robin guarantees each machine receives "
-                            f"every 4th job regardless of queue state."
-                        ),
-                        "reasoning": "[Rule-based — imbalance detected from completed-parts data]",
-                    }
+                    routing_reason = (
+                        f"Job distribution is {job_imbalance:.1f}× unbalanced.  "
+                        f"Round-robin guarantees each machine receives every "
+                        f"Nth job in rotation."
+                    )
+                recs.append(reason_str)
+                acts.append({
+                    "target": "factory",
+                    "intent": "factory_set_routing",
+                    "parameters": {"routing_strategy": "round_robin"},
+                    "reasoning": "Improve fleet utilisation by balancing job distribution.",
+                })
+                return {
+                    "recommendation": "  ".join(recs),
+                    "actions": acts,
+                    "policy_suggestion": None,
+                    "routing_strategy": "round_robin",
+                    "routing_reasoning": routing_reason,
+                    "reasoning": "[Rule-based — sequential strategy detected with low utilisation]",
+                }
             recs.append(
                 "To reduce idle time: ensure the queue always has jobs ready "
                 "by pre-running the CAM pipeline on the next seeds."
