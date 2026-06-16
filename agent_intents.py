@@ -482,6 +482,132 @@ _ACTION_SIGNALS: list[str] = [
 ]
 
 
+# ── LLM-based intent classifier (agent level) ─────────────────────────────────
+#
+# Identical architecture to classify_with_llm() in factory_intents.py:
+#   system message = static system prompt + full INTENT_CATALOGUE (~1 400 tokens)
+#                    → cached by OpenAI after the first call
+#   user   message = operator sentence only (~10 tokens, always fresh)
+#
+# Returns the validated intent_id string, or None on any error so the caller
+# falls back to the keyword classifier without interruption.
+
+_AGENT_CLASSIFIER_SYSTEM_PROMPT: Optional[str] = None   # built lazily
+
+
+def _build_agent_classifier_system_prompt() -> str:
+    """
+    Build the static system prompt for the per-machine LLM classifier.
+    Includes the full INTENT_CATALOGUE as a reference list.
+    Called once; result stored in _AGENT_CLASSIFIER_SYSTEM_PROMPT.
+    """
+    lines = [
+        # ── Verbatim system prompt ──
+        "You are an intent classification model for a CNC factory system."
+        " Your task is to read a user’s natural-language sentence and select"
+        " the single best matching intent from a provided list of candidate"
+        " intents. Each intent includes a name, description, and parameters,"
+        " and represents a concrete action, query, or advisory capability"
+        " within the system. The user may phrase requests in many different"
+        " ways, so you must match based on meaning, not keywords. Carefully"
+        " consider whether the user is asking for information (query),"
+        " requesting a change (action), or seeking advice or optimisation"
+        " (advisory). Choose the intent whose purpose most closely aligns"
+        " with the user’s underlying goal. If the request implies"
+        " improvement, recommendations, or analysis beyond simple data"
+        " retrieval, prefer an advisory intent. Return only the selected"
+        " intent_id and ensure it is one of the provided options. Do not"
+        " invent new intents. If the meaning is ambiguous, choose the closest"
+        " match based on overall intent rather than specific wording.",
+        "",
+        "This is the per-machine CNC agent assistant.  The operator is talking"
+        " directly to one machine (M01, M02, M03, or M04).",
+        "",
+        "Available intents:",
+        "",
+    ]
+
+    for cat in ("execution", "tool", "program", "status", "diagnostic"):
+        cat_intents = [i for i in INTENT_CATALOGUE if i.category == cat]
+        if not cat_intents:
+            continue
+        lines.append(f"--- {cat.upper()} INTENTS ---")
+        for intent in cat_intents:
+            lines.append(f"intent_id: {intent.intent_id}")
+            lines.append(f"  category   : {intent.category}")
+            lines.append(f"  label      : {intent.label}")
+            lines.append(f"  description: {intent.description}")
+            if intent.parameters:
+                lines.append(f"  parameters : {', '.join(intent.parameters)}")
+            if intent.example:
+                lines.append(f"  example    : {intent.example}")
+            lines.append("")
+
+    lines += [
+        "Respond with ONLY the intent_id string — nothing else.",
+        "Do not include quotes, punctuation, or explanation.",
+        "The intent_id must be exactly one of the options listed above.",
+    ]
+    return "\n".join(lines)
+
+
+def classify_agent_with_llm(
+    text: str,
+    llm_client,
+    model: str = "gpt-4o-mini",
+) -> Optional[str]:
+    """
+    Classify *text* into a single machine-agent intent_id using OpenAI.
+
+    The static system message (INTENT_CATALOGUE + rules) is built once and
+    reused so OpenAI can cache it.  Only the operator sentence changes.
+
+    Returns
+    -------
+    str   — a valid intent_id from INTENT_MAP, or
+    None  — on any error; caller falls back to keyword classifier.
+    """
+    global _AGENT_CLASSIFIER_SYSTEM_PROMPT
+    if _AGENT_CLASSIFIER_SYSTEM_PROMPT is None:
+        _AGENT_CLASSIFIER_SYSTEM_PROMPT = _build_agent_classifier_system_prompt()
+
+    try:
+        import time as _time
+        t0   = _time.monotonic()
+        comp = llm_client.chat.completions.create(
+            model       = model,
+            max_tokens  = 12,
+            temperature = 0.0,
+            messages    = [
+                {"role": "system", "content": _AGENT_CLASSIFIER_SYSTEM_PROMPT},
+                {"role": "user",   "content": text},
+            ],
+        )
+        elapsed_ms = (_time.monotonic() - t0) * 1000
+
+        raw       = (comp.choices[0].message.content or "").strip()
+        intent_id = raw.strip('"\' \n')
+
+        if intent_id not in INTENT_MAP:
+            return None
+
+        usage  = getattr(comp, "usage", None)
+        ptd    = getattr(usage, "prompt_tokens_details", None) if usage else None
+        cached = getattr(ptd, "cached_tokens", None)
+        classify_agent_with_llm._last_stats = (
+            f"LLM agent classifier: {intent_id!r}  latency={elapsed_ms:.0f}ms"
+            + (f"  cached={cached}/{getattr(usage,'prompt_tokens',0)} tokens"
+               if cached is not None else "")
+        )
+        return intent_id
+
+    except Exception:
+        return None
+
+
+classify_agent_with_llm._last_stats: str = ""
+
+
 def classify_message(text: str) -> tuple[str, Optional[str]]:
     """
     Classify operator free text as:
@@ -646,16 +772,31 @@ class IntentExecutor:
 
     def _do_query_tool_crib(self, p: dict) -> dict:
         tools = self._agent.tool_crib.state_list()
-        lines = [f"Tool crib — {self._agent.machine_id}  ({len(tools)} tools):",
-                 f"  {'ID':<5} {'Dia':>6}  {'Inserts':>7}  {'Life':>6}  {'Status'}"]
-        lines.append("  " + "─" * 48)
+        # state_list() returns: tool_id, diameter_mm, shank_length_mm,
+        #   remaining_life_hrs, remaining_life_pct, needs_replacement
+        # n_inserts is on the ToolRecord itself (not in state_list dict)
+        lines = [
+            f"Tool crib \u2014 {self._agent.machine_id}  ({len(tools)} tools):",
+            f"  {'ID':<5} {'\u00d8 mm':>6}  {'Shank mm':>9}  "
+            f"{'Life hrs':>9}  {'Life %':>7}  Status",
+        ]
+        lines.append("  " + "\u2500" * 56)
         for t in tools:
-            life = t.get("remaining_life_pct", 0)
-            status = ("⛔ STOP" if t.get("needs_replacement")
-                      else ("⚠ WARN" if life < 20 else "✓ OK"))
+            life     = t.get("remaining_life_pct", 0.0)
+            life_hrs = t.get("remaining_life_hrs",  0.0)
+            shank    = t.get("shank_length_mm",     0.0)
+            bar_w    = max(0, min(10, int(life / 10)))
+            bar      = "\u2588" * bar_w + "\u2591" * (10 - bar_w)
+            status   = ("\u26d4 STOP" if t.get("needs_replacement")
+                        else ("\u26a0 WARN" if life < 20 else "\u2713 OK"))
+            # Fetch n_inserts directly from the ToolRecord (not in state_list)
+            tr = self._agent.tool_crib.get(t["tool_id"])
+            inserts_str = str(tr.n_inserts) if tr is not None else "—"
             lines.append(
-                f"  {t['tool_id']:<5} {t['diameter_mm']:>5.0f}mm  "
-                f"{t['n_inserts']:>7}  {life:>5.1f}%  {status}"
+                f"  {t['tool_id']:<5} {t['diameter_mm']:>6.1f}  "
+                f"{shank:>9.1f}  "
+                f"{life_hrs:>9.2f}  [{bar}]{life:>5.1f}%  "
+                f"{status}  ({inserts_str} inserts)"
             )
         return {"intent": "query_tool_crib", "result": "\n".join(lines), "raw": tools}
 

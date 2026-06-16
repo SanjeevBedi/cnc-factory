@@ -387,42 +387,96 @@ class AgentConversationWindow(tk.Toplevel):
         if agent is None:
             return
 
-        # ── Classify: query vs disturbance action ─────────────────────────
+        # ── Intent routing ────────────────────────────────────────────────
+        #
+        # Step 1 — LLM classifier (when OpenAI is available):
+        #   Static system message = full INTENT_CATALOGUE (~1 400 tokens),
+        #   cached by OpenAI after the first call.
+        #   User message = operator sentence only.
+        #
+        # Step 2 — Keyword/regex fallback (no network required):
+        #   Three-path classifier: query → Path A, action → Path B,
+        #   unknown → Path C (full LLM disturbance pipeline).
         import threading
+        import config
         from agent_intents import (
             classify_message, extract_parameters,
             classify_action, ActionExecutor,
+            classify_agent_with_llm, INTENT_MAP,
         )
 
-        msg_type, intent_id = classify_message(txt)
+        # ── Step 1: LLM classifier ────────────────────────────────────────
+        llm_intent_id = None
+        _llm_client = getattr(getattr(self._app, "fa", None), "_llm_client", None)
+        if _llm_client is not None:
+            llm_intent_id = classify_agent_with_llm(
+                txt, _llm_client, model=config.OPENAI_MODEL
+            )
 
-        if msg_type == "query":
-            # ── Path A: data query — direct answer, no LLM ──────────────
-            params = extract_parameters(txt, intent_id)
-            threading.Thread(
-                target=self._answer_query,
-                args=(agent, intent_id, params),
-                daemon=True,
-            ).start()
-
-        else:
-            action_type, action_params = classify_action(txt)
-
-            if action_type != "unknown":
-                # ── Path B: known deterministic action ──────────────────
+        # ── Step 2: route ─────────────────────────────────────────────────
+        if llm_intent_id is not None:
+            _intent_obj = INTENT_MAP[llm_intent_id]
+            if _intent_obj.category in ("execution", "tool", "program",
+                                        "status", "diagnostic"):
+                # Decide query vs action from catalogue category
+                _QUERY_CATS = {"status", "diagnostic"}
+                _QUERY_IDS  = {i.intent_id for i in INTENT_MAP.values()
+                               if i.intent_id.startswith("query_")}
+                if llm_intent_id in _QUERY_IDS:
+                    # Path A — direct data query
+                    _params = extract_parameters(txt, llm_intent_id)
+                    threading.Thread(
+                        target=self._answer_query,
+                        args=(agent, llm_intent_id, _params),
+                        daemon=True,
+                    ).start()
+                else:
+                    # Path B — action
+                    _, _action_params = classify_action(txt)
+                    _action_params["question"] = txt
+                    threading.Thread(
+                        target=self._execute_action,
+                        args=(agent, llm_intent_id, _action_params),
+                        daemon=True,
+                    ).start()
+            else:
+                # Fallback for any unrecognised category
+                _, _action_params = classify_action(txt)
+                _action_params["question"] = txt
                 threading.Thread(
                     target=self._execute_action,
-                    args=(agent, action_type, action_params),
+                    args=(agent, llm_intent_id, _action_params),
+                    daemon=True,
+                ).start()
+        else:
+            # ── Keyword fallback ──────────────────────────────────────────
+            msg_type, intent_id = classify_message(txt)
+
+            if msg_type == "query":
+                # Path A — direct data query
+                params = extract_parameters(txt, intent_id)
+                threading.Thread(
+                    target=self._answer_query,
+                    args=(agent, intent_id, params),
                     daemon=True,
                 ).start()
             else:
-                # ── Path C: complex / ambiguous → full LLM pipeline ─────
-                agent.inject_error(txt)
-                threading.Thread(
-                    target=self._app._diagnose_disturbance,
-                    args=(agent, None, {}, self),
-                    daemon=True,
-                ).start()
+                action_type, action_params = classify_action(txt)
+                if action_type != "unknown":
+                    # Path B — deterministic action
+                    threading.Thread(
+                        target=self._execute_action,
+                        args=(agent, action_type, action_params),
+                        daemon=True,
+                    ).start()
+                else:
+                    # Path C — complex / ambiguous → full LLM pipeline
+                    agent.inject_error(txt)
+                    threading.Thread(
+                        target=self._app._diagnose_disturbance,
+                        args=(agent, None, {}, self),
+                        daemon=True,
+                    ).start()
 
     def _answer_query(self, agent, intent_id: str, parameters: dict) -> None:
         """Execute a query intent and stream the result into the chat log."""
@@ -444,7 +498,13 @@ class AgentConversationWindow(tk.Toplevel):
         if msim is not None:
             executor._msim = msim
 
-        result = executor.execute(intent_id, parameters)
+        try:
+            result = executor.execute(intent_id, parameters)
+        except Exception as _exc:
+            import traceback as _tb
+            post("factory", f"⚠ Query failed ({intent_id}): {_exc}")
+            post("factory", _tb.format_exc()[:400])
+            return
 
         intent_label = INTENT_MAP[intent_id].label if intent_id in INTENT_MAP else intent_id
         post("factory", f"ℹ {intent_label}")
