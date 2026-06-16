@@ -294,6 +294,19 @@ FACTORY_INTENT_CATALOGUE: list[FactoryIntent] = [
         ("option_letter",),
         example='{"intent":"factory_implement_tool_option","option_letter":"A"}',
     ),
+    FactoryIntent(
+        "factory_set_routing", "action",
+        "Set the active job routing strategy",
+        "Hotswap the routing algorithm that assigns incoming jobs to machines. "
+        "Valid strategies: round_robin (cycles M01→M02→M03→M04→M01), "
+        "sequential (M01-first waterfall — overflow to M02/M03/M04), "
+        "random (uniform random selection). "
+        "Change is live immediately and forgotten when the program exits. "
+        "Use this when the operator says 'implement round robin', "
+        "'use sequential', 'switch to random routing', etc.",
+        ("routing_strategy",),
+        example='{"intent":"factory_set_routing","routing_strategy":"round_robin"}',
+    ),
 ]
 
 FACTORY_INTENT_MAP: dict[str, FactoryIntent] = {
@@ -992,6 +1005,16 @@ _FACTORY_ACTION_PATTERNS: list[tuple[str, list[str]]] = [
         "run stats on seed", "analyse machining of", "analyze machining of",
         "statistics on seed", "machining analysis for",
     ]),
+    ("factory_set_routing", [
+        "implement round robin", "use round robin", "activate round robin",
+        "switch to round robin", "set routing round robin",
+        "routing to round", "round robin routing",
+        "implement sequential", "use sequential routing", "activate sequential",
+        "switch to sequential", "set routing sequential",
+        "implement random routing", "use random routing", "activate random routing",
+        "set routing random", "random routing",
+        "set routing", "change routing to", "switch routing to",
+    ]),
     ("factory_implement_tool_option", [
         "implement option", "apply option", "use option",
         "choose option", "go with option", "select option",
@@ -1049,6 +1072,16 @@ def classify_factory_action(text: str) -> tuple[str, dict]:
         if alias in lower:
             params["policy"] = canonical
             break
+
+    # Extract routing strategy for factory_set_routing
+    _rt_lo = lower
+    if "round" in _rt_lo:
+        params["routing_strategy"] = "round_robin"
+    elif "sequen" in _rt_lo:
+        params["routing_strategy"] = "sequential"
+    elif "random" in _rt_lo:
+        params["routing_strategy"] = "random"
+    # (default applied in handler if key missing)
 
     # Extract option letter (A / B / C) for factory_implement_tool_option
     om = _re.search(r'\boption\s+([A-Ca-c])\b', text)
@@ -2121,6 +2154,25 @@ class FactoryActionExecutor:
              f"Ø{new_dia:.0f}mm{sub_msg}"),
         ]
 
+    def _do_factory_set_routing(self, p: dict) -> list[tuple]:
+        """
+        Hotswap the active routing strategy.
+        Installs a closure into app._routing_fn — live immediately,
+        forgotten when the program exits.  No files modified.
+        """
+        txt = (p.get("routing_strategy", "")
+               or p.get("question", "")).lower()
+        if "round" in txt:
+            strategy = "round_robin"
+        elif "seq" in txt:
+            strategy = "sequential"
+        elif "rand" in txt:
+            strategy = "random"
+        else:
+            strategy = "round_robin"   # default when ambiguous
+        reasoning = f"Operator requested {strategy.replace('_', '-')} routing."
+        return self._hotswap_routing(strategy, reasoning)
+
     def _do_factory_set_policy(self, p: dict) -> list[tuple]:
         from scheduler import VALID_POLICIES
         new_policy = p.get("policy", "")
@@ -2276,7 +2328,7 @@ class FactoryActionExecutor:
             "     (M03/M04 sit idle waiting for seeds to be generated)",
         ]
 
-        # ── Section 3: Strategy options ───────────────────────────────────
+        # ── Section 3: Hotswappable strategy options ───────────────────────────
         avg_job_min = 0.0
         if gui_done:
             all_totals = [
@@ -2285,50 +2337,37 @@ class FactoryActionExecutor:
             ]
             avg_job_min = (sum(all_totals) / len(all_totals)) / 60
 
-        batch_size = n_machines  # collect one job per machine then release
+        active_strategy = getattr(
+            getattr(self, "_app", None), "_routing_strategy_name", "sequential"
+        )
+        def _tag(s):
+            return "  ★ ACTIVE" if s == active_strategy else ""
 
         lines += [
             "",
-            "SECTION 3 — Strategy comparison",
+            "SECTION 3 — Available routing strategies",
+            "  All changes are live-only — forgotten when the program exits.",
             "─" * 58,
             "",
-            f"  Avg job cycle time: {avg_job_min:.1f} min",
-            f"  Machines: {n_machines}",
+            f"  A)  ROUND-ROBIN{_tag('round_robin')}",
+            f"      job 1→M01, job 2→M02, job 3→M03, job 4→M04, job 5→M01…",
+            f"      Every machine receives every {n_machines}th job in strict rotation.",
+            f"      Latency: none.  Distribution: perfectly even.",
+            f"      To activate: type  'implement round robin'",
             "",
-            "  A)  ROUND-ROBIN assignment  (immediate fix for starvation)",
-            "      Send job 1 → M01, job 2 → M02, job 3 → M03, job 4 → M04,",
-            "      job 5 → M01 again.  Guarantees equal share regardless of",
-            "      queue depth differences.",
-            f"      Expected utilisation gain: from {overall_util:.0f}% → ~{min(95, overall_util * n_machines / max(1, sum(1 for m in all_mids if job_count.get(m, 0) > 0))):.0f}%",
-            "      Latency impact: none — still immediate dispatch.",
-            "      ⚡ Recommended for your current situation.",
+            f"  B)  SEQUENTIAL — M01-first waterfall{_tag('sequential')}",
+            f"      Each part tries M01 first (idle or queue has space),",
+            f"      then M02, M03, M04 in order.  M01 absorbs all work it can;",
+            f"      later machines receive overflow only.",
+            f"      To activate: type  'implement sequential'",
             "",
-            f"  B)  BATCH scheduling  (collect {batch_size} jobs, release together)",
-            f"      Hold jobs until {batch_size} are ready, then dispatch one to",
-            "      each machine simultaneously.  Ensures all machines start",
-            "      together after every tool change / setup cycle.",
-            f"      Batch fill time at current seed rate: ~{avg_job_min * 0.3:.1f} min",
-            f"        (assuming CAM is ~30% of job cycle time)",
-            "      ✓  Eliminates inter-job idle gaps between machines.",
-            "      ✗  First part of each batch waits up to (batch fill time)",
-            f"         before it starts.  Adds ~{avg_job_min * 0.3:.1f} min latency.",
-            "      Suitable for: high-volume identical parts (same seed).",
-            "",
-            "  C)  RANDOM assignment",
-            "      Choose machine randomly (uniform) from enabled machines.",
-            "      Statistically approaches round-robin over many jobs.",
-            "      ✓  Simple.  ✗  Can cluster jobs on one machine by bad luck.",
-            "      Inferior to round-robin for small job counts.",
-            "",
-            "  D)  LEAST-LOADED (current) + CAM pre-warming",
-            "      Keep the current shortest-queue routing but start CAM for",
-            f"      the NEXT {batch_size} seeds in background before machines finish.",
-            "      Jobs are ready to dispatch the moment a machine goes idle.",
-            "      ✓  No latency increase.  ✓  Fills idle gaps.",
-            "      ✗  Requires pre-seeding logic (seeds must be known ahead).",
+            f"  C)  RANDOM{_tag('random')}",
+            f"      Uniform random selection from enabled machines.",
+            f"      Statistically approaches round-robin over many jobs.",
+            f"      To activate: type  'implement random routing'",
         ]
 
-        # ── Section 4: Concrete recommendation ───────────────────────────
+        # ── Section 4: Recommendation — hotswap fires here, no trigger-word gate ────
         lines += [
             "",
             "SECTION 4 — Recommendation for your situation",
@@ -2337,53 +2376,53 @@ class FactoryActionExecutor:
 
         imb = (max(job_count.values()) / max(1, min(job_count.values()))
                if job_count else 1)
-        if imb >= 3:
-            rec = "A — Round-robin routing"
+
+        if active_strategy == "round_robin":
+            best_strategy = "round_robin"
             reason = (
-                f"Your job distribution is severely unbalanced ({imb:.1f}× ratio).\n"
-                f"  Round-robin will immediately share load across all {n_machines} machines\n"
-                f"  without any latency penalty."
+                f"Round-robin is already active and distributing work evenly "
+                f"({imb:.1f}× imbalance ratio — "
+                + ("good." if imb < 1.5 else "some variance expected with different cycle times.")
+                + ")"
             )
-            action = "  → In factory_gui.py: change _route_dest_only() to use a\n     rotating counter instead of min(queue length)."
-        elif overall_util < 50:
-            rec = "D — Pre-warm CAM pipeline"
+            do_hotswap = False
+        elif imb >= 2.5:
+            best_strategy = "round_robin"
             reason = (
-                f"Fleet utilisation is {overall_util:.0f}%.  The bottleneck is seed\n"
-                f"  generation speed, not scheduling.  Pre-warming CAM keeps jobs\n"
-                f"  ready so machines never wait."
+                f"Job distribution is unbalanced ({imb:.1f}× ratio).  "
+                f"Round-robin immediately shares load evenly across all {n_machines} machines "
+                f"with no latency penalty."
             )
-            action = "  → Increase SIM_MAX_AHEAD_PER_MACHINE in config.py\n     or increase auto-seed probability."
+            do_hotswap = True
         else:
-            rec = "B — Batch scheduling"
+            best_strategy = active_strategy or "sequential"
             reason = (
-                f"Utilisation is {overall_util:.0f}%.  Batching {batch_size} jobs (one per\n"
-                f"  machine) before dispatching will synchronise machine cycles\n"
-                f"  and reduce inter-job idle time."
+                f"Distribution is balanced ({imb:.1f}× ratio) and utilisation "
+                f"is {overall_util:.0f}%.  Current strategy ({active_strategy}) is appropriate."
             )
-            action = f"  → Collect {batch_size} CAM-ready jobs before releasing any."
+            do_hotswap = False
 
         lines += [
-            f"  BEST STRATEGY: {rec}",
+            f"  BEST STRATEGY: {best_strategy.replace('_', '-').upper()}",
             f"  Reason: {reason}",
-            f"  How to implement:",
-            action,
             "",
-            "  Also useful regardless of strategy chosen:",
+            "  Also useful regardless of strategy:",
             "    • 'set policy min_time'  — uses largest tools / highest feeds",
-            "    • Increase SIM_MAX_AHEAD_PER_MACHINE to pre-fill machine queues",
             "    • Monitor tool life — tool changes cause unexpected idle gaps",
         ]
 
         out = [("factory", "\n".join(lines))]
-        # When the question asks for a recommendation (not just a report),
-        # chain into _do_factory_ai_advice so the hotswap fires.
-        q = p.get("question", "").lower()
-        _HOTSWAP_TRIGGERS = [
-            "best way", "can we", "should we", "improve", "fix",
-            "what do", "recommend", "advise", "not good",
-        ]
-        if any(k in q for k in _HOTSWAP_TRIGGERS):
-            out += self._do_factory_ai_advice(p)
+
+        # Hotswap fires directly when the data justifies it.
+        # No keyword gate — if the analysis shows imbalance, fix it now.
+        if do_hotswap:
+            reasoning = (
+                f"Sequential M01-first routing produced {imb:.1f}× job imbalance.  "
+                f"Round-robin cycles M01→M02→M03→M04 so every machine "
+                f"receives every {n_machines}th job in strict rotation."
+            )
+            out += self._hotswap_routing("round_robin", reasoning)
+
         return out
 
     def _do_factory_ai_advice(self, p: dict) -> list[tuple]:
