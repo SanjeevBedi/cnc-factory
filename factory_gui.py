@@ -1689,16 +1689,19 @@ class FactoryGUI(tk.Tk):
         crib is used for tool selection.
         Returns machine_id, or None if all machines are disabled.
 
-        Default strategy — "sequential" (demo starting point):
-          Cycles through enabled machines in sorted order:
-          job 1 → M01, job 2 → M02, job 3 → M03, job 4 → M04,
-          job 5 → M01, …
-          This creates a clear, observable pattern:
-            • every machine gets an equal share of jobs in rotation
-            • because cycle times differ, some machines become idle
-              while others still have queued work → visible in idle-time
-              query → AI recommends round-robin to let faster machines
-              pull extra work dynamically.
+        Default strategy — "sequential" (M01-first waterfall):
+          Every new part is offered to M01 first.
+          A machine is eligible if it is idle (current_job is None)
+          OR its local queue has space (len(queue) < SIM_MAX_AHEAD_PER_MACHINE).
+          The first eligible machine in sorted order (M01, M02, M03, M04) wins.
+
+          Pattern this creates:
+            • M01 absorbs all jobs until its queue is full.
+            • M02 only gets work when M01 is busy AND its queue is full.
+            • M03/M04 only receive overflow when all preceding machines
+              are saturated.
+          Observable effect: idle-time query shows M01 at high utilisation,
+          M04 at low utilisation → AI recommends round-robin hotswap.
 
         AI hotswap:
           When _routing_fn is set by FactoryActionExecutor._hotswap_routing()
@@ -1717,12 +1720,18 @@ class FactoryGUI(tk.Tk):
         if fn is not None:
             return fn(eligible)
 
-        # Default: sequential cycling  (M01 → M02 → M03 → M04 → M01 → …)
-        # _seq_idx is initialised lazily so __init__ stays clean.
-        idx = getattr(self, "_seq_idx", 0)
-        mid = eligible[idx % len(eligible)][0]
-        self._seq_idx = idx + 1
-        return mid
+        # Default: sequential M01-first waterfall
+        # Try each machine in order; take the first that is free or has queue room.
+        for mid, m in eligible:
+            is_idle   = (m.current_job is None or m.status == "idle")
+            has_space = (len(m.queue) < config.SIM_MAX_AHEAD_PER_MACHINE)
+            if is_idle or has_space:
+                return mid
+
+        # All machines are busy with full queues — overflow to M01
+        # (the back-pressure / overflow guard in _do_sim_step will
+        #  suppress further spawning until a slot opens).
+        return eligible[0][0]
 
     def _route_job(self, job) -> "Optional[str]":
         """
