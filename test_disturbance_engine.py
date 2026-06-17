@@ -240,7 +240,7 @@ class TestFallbackResponses(unittest.TestCase):
         cands = self._fallback("material_harder",
                                {"original_material":"aluminium_6061",
                                 "actual_material":"mild_steel_1018"})
-        self.assertIn(cands[0].action, ("recalculate","abort"))
+        self.assertIn(cands[0].action, ("pause_redo_cam","abort"))
 
     def test_material_harder_inconel_triggers_abort_when_power_exceeds(self):
         """Al → Inconel: ratio=5.83 — power should exceed machine limit."""
@@ -256,9 +256,8 @@ class TestFallbackResponses(unittest.TestCase):
                                {"original_material":"alloy_steel_4140",
                                 "actual_material":"aluminium_6061"})
         self.assertGreater(len(cands), 0)
-        # first candidate should suggest more feed or continue
-        self.assertIn(cands[0].action,
-                      ("recalculate","continue","reduce_feed","increase_feed"))
+        # per spec: pause and redo CAM for any material mismatch
+        self.assertIn(cands[0].action, ("pause_redo_cam", "abort"))
 
     def test_recalculate_candidate_has_numeric_params(self):
         cands = self._fallback("material_harder",
@@ -276,7 +275,7 @@ class TestFallbackResponses(unittest.TestCase):
         cands = self._fallback("tool_breakage",
                                {"tool_id":"T3","no_stock":True})
         actions = [c.action for c in cands]
-        self.assertIn("rework", actions)
+        self.assertIn("request_tool_change", actions)
 
     # spindle_overload ────────────────────────────────────────────────────────
 
@@ -288,18 +287,18 @@ class TestFallbackResponses(unittest.TestCase):
     def test_spindle_overload_severe(self):
         cands = self._fallback("spindle_overload",
                                {"overload_pct": 55.0, "measured_kw": 11.7})
-        # severe overload — first candidate should recommend abort or reduce_feed
-        self.assertIn(cands[0].action, ("abort","reduce_feed"))
+        # always reduce spindle speed per the new disturbance spec
+        self.assertEqual(cands[0].action, "reduce_spindle_speed")
 
     # safety critical ─────────────────────────────────────────────────────────
 
     def test_fixture_loose_emergency_stop(self):
         cands = self._fallback("fixture_loose")
-        self.assertEqual(cands[0].action, "emergency_stop")
+        self.assertEqual(cands[0].action, "stop_unload_delay_restart")
 
     def test_spindle_bearing_emergency_stop(self):
         cands = self._fallback("spindle_bearing")
-        self.assertEqual(cands[0].action, "emergency_stop")
+        self.assertEqual(cands[0].action, "stop_machine_oos")
 
     # coolant ─────────────────────────────────────────────────────────────────
 
@@ -308,7 +307,7 @@ class TestFallbackResponses(unittest.TestCase):
                         original_material="titanium_ti64",
                         extra={"coolant_type":"flood","partial_loss":False})
         cands = self.engine.fallback_responses(ctx)
-        self.assertEqual(cands[0].action, "abort")
+        self.assertEqual(cands[0].action, "stop_request_coolant")
 
     def test_coolant_al_short_run_dry(self):
         ctx = _make_ctx(disturbance_key="coolant_failure",
@@ -316,8 +315,8 @@ class TestFallbackResponses(unittest.TestCase):
                         sections_remaining=["Face 3"],
                         extra={"coolant_type":"flood","partial_loss":False})
         cands = self.engine.fallback_responses(ctx)
-        # only 1 section left — continue_dry is valid
-        self.assertIn(cands[0].action, ("continue_dry","abort"))
+        # always stop and request coolant per the new policy
+        self.assertEqual(cands[0].action, "stop_request_coolant")
 
     # dimension_error ─────────────────────────────────────────────────────────
 
@@ -325,13 +324,13 @@ class TestFallbackResponses(unittest.TestCase):
         cands = self._fallback("dimension_error",
                                {"nominal_mm":50.0,"actual_mm":49.9,
                                 "tolerance_mm":0.05,"feature":"bore depth"})
-        self.assertEqual(cands[0].action, "rework")
+        self.assertEqual(cands[0].action, "stop_unload_return")
 
     def test_dimension_undercut_finish_pass(self):
         cands = self._fallback("dimension_error",
                                {"nominal_mm":50.0,"actual_mm":50.08,
                                 "tolerance_mm":0.05,"feature":"bore depth"})
-        self.assertEqual(cands[0].action, "add_finish_pass")
+        self.assertEqual(cands[0].action, "stop_unload_return")
 
     def test_dimension_in_tolerance_continue(self):
         cands = self._fallback("dimension_error",
