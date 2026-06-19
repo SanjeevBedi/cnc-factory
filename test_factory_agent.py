@@ -373,6 +373,31 @@ class TestFactoryAgent(unittest.TestCase):
         self.assertIn("Operator context:", prompt)
         self.assertIn('"category": "vibration"', prompt)
 
+    def test_operator_policy_directive_updates_scheduler_policy(self):
+        fa = _factory()
+        rec = fa.handle_operator_input("M01", "Switch scheduling policy to max tool life")
+        self.assertTrue(rec["applied"])
+        self.assertEqual(rec["action"], "set_policy")
+        self.assertEqual(rec["parameters"]["policy"], "max_tool_life")
+        self.assertEqual(rec["context"]["event_type"], "operator_directive")
+        self.assertEqual(rec["context"]["category"], "policy")
+        self.assertEqual(fa.policy, "max_tool_life")
+        self.assertEqual(fa.scheduler.policy, "max_tool_life")
+
+    def test_operator_policy_directive_visible_in_state(self):
+        fa = _factory()
+        fa.handle_operator_input("M02", "Optimize schedule for best finish policy")
+        state = fa.get_factory_state()
+        self.assertEqual(state["policy"], "best_finish")
+        self.assertEqual(
+            state["operator_feedback_log"][0]["parameters"]["policy"],
+            "best_finish",
+        )
+        self.assertEqual(
+            state["operator_context_by_machine"]["M02"]["event_type"],
+            "operator_directive",
+        )
+
 
 if __name__ == "__main__":
     loader = unittest.TestLoader()

@@ -33,7 +33,7 @@ from cnc_agent import (
     build_default_crib,
     _MACHINE_TOOL_DATA,
 )
-from scheduler import Scheduler, Job, make_job
+from scheduler import Scheduler, Job, make_job, VALID_POLICIES
 
 # optional OpenAI
 try:
@@ -117,6 +117,10 @@ _POLICY_ACTION_SCORES: dict[str, dict[str, float]] = {
 _RISK_PENALTY: dict[str, float] = {
     "safe": 0.0, "risky": -0.1, "catastrophic": -0.5,
 }
+
+_OPERATOR_OVERRIDE_ACTIONS = frozenset(
+    {"continue", "reduce_feed", "rework", "abort"}
+)
 
 
 # ── Factory Agent -------------------------------------------------------------
@@ -242,6 +246,8 @@ class FactoryAgent:
         params: dict = {}
         if agent is not None and active_error:
             action, params = self._parse_operator_override(clean_text)
+        if action is None:
+            action, params = self._parse_operator_directive(clean_text)
         context = self._build_operator_context(
             agent,
             clean_text,
@@ -265,7 +271,7 @@ class FactoryAgent:
             self.operator_context_by_machine[machine_id] = dict(context)
 
         if agent is not None and active_error:
-            if action is not None:
+            if action in _OPERATOR_OVERRIDE_ACTIONS:
                 agent.handle_factory_response({"action": action, **params})
                 record["applied"] = True
                 record["action"] = action
@@ -275,6 +281,12 @@ class FactoryAgent:
                 operator_note = f" | operator: {clean_text}"
                 if operator_note.lower() not in desc.lower():
                     agent.active_error.description = f"{desc}{operator_note}"
+
+        if action not in _OPERATOR_OVERRIDE_ACTIONS:
+            if self._apply_operator_directive(action, params):
+                record["applied"] = True
+                record["action"] = action
+                record["parameters"] = dict(params)
 
         self.operator_feedback_log.append(record)
         return record
@@ -365,6 +377,47 @@ class FactoryAgent:
         return None, {}
 
     @staticmethod
+    def _parse_operator_directive(text: str) -> tuple[Optional[str], dict]:
+        normalized = re.sub(r"[_-]+", " ", text.lower())
+        normalized = re.sub(r"\s+", " ", normalized).strip()
+        if not normalized:
+            return None, {}
+        if not re.search(
+            r"\b(policy|schedule|scheduling|prioriti[sz]e|optimi[sz]e|focus)\b",
+            normalized,
+        ):
+            return None, {}
+
+        aliases = {
+            "min time": "min_time",
+            "minimum time": "min_time",
+            "min cost": "min_cost",
+            "minimum cost": "min_cost",
+            "best finish": "best_finish",
+            "max tool life": "max_tool_life",
+            "maximum tool life": "max_tool_life",
+            "multi objective": "multi_objective",
+        }
+        for alias, policy in aliases.items():
+            if alias in normalized:
+                return "set_policy", {"policy": policy}
+        return None, {}
+
+    def _apply_operator_directive(
+        self,
+        action: Optional[str],
+        params: dict,
+    ) -> bool:
+        if action != "set_policy":
+            return False
+        policy = str(params.get("policy", ""))
+        if policy not in VALID_POLICIES:
+            return False
+        self.policy = policy
+        self.scheduler.policy = policy
+        return True
+
+    @staticmethod
     def _build_operator_context(
         agent: Optional[CncAgent],
         text: str,
@@ -375,7 +428,15 @@ class FactoryAgent:
     ) -> dict:
         lower = text.lower()
         category = "general"
-        if any(word in lower for word in ("chatter", "vibration", "resonance")):
+        event_type = "operator_note"
+        if action in _OPERATOR_OVERRIDE_ACTIONS:
+            event_type = "operator_override"
+        elif action is not None:
+            event_type = "operator_directive"
+
+        if action == "set_policy":
+            category = "policy"
+        elif any(word in lower for word in ("chatter", "vibration", "resonance")):
             category = "vibration"
         elif any(word in lower for word in ("collision", "crash", "impact")):
             category = "collision_risk"
@@ -411,7 +472,7 @@ class FactoryAgent:
         }
 
         return {
-            "event_type": "operator_override" if action is not None else "operator_note",
+            "event_type": event_type,
             "category": category,
             "severity": severity,
             "location": location,
