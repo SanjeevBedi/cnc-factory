@@ -347,7 +347,7 @@ class TestFactoryAgent(unittest.TestCase):
             state["operator_feedback_log"][0]["parameters"]["feed_override_pct"],
             65.0,
         )
-        json.dumps(state)
+        self.assertIsInstance(json.dumps(state), str)
 
 
 if __name__ == "__main__":

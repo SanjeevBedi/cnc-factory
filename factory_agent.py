@@ -256,8 +256,9 @@ class FactoryAgent:
                 record["parameters"] = dict(params)
             elif clean_text:
                 desc = agent.active_error.description
-                if clean_text.lower() not in desc.lower():
-                    agent.active_error.description = f"{desc} | operator: {clean_text}"
+                operator_note = f" | operator: {clean_text}"
+                if operator_note.lower() not in desc.lower():
+                    agent.active_error.description = f"{desc}{operator_note}"
 
         self.operator_feedback_log.append(record)
         return record
@@ -329,17 +330,18 @@ class FactoryAgent:
     @staticmethod
     def _parse_operator_override(text: str) -> tuple[Optional[str], dict]:
         lower = text.lower()
-        pct_match = re.search(r"(\d+(?:\.\d+)?)\s*%", lower)
-        if "abort" in lower or "stop" in lower:
+        if re.search(r"\b(abort|stop)\b", lower):
             return "abort", {}
-        if "rework" in lower:
+        if re.search(r"\brework\b", lower):
             return "rework", {}
-        if "reduce" in lower or "slow" in lower:
-            params = {}
+        if re.search(r"\b(reduce|slow)\b", lower):
+            pct_match = re.search(r"(\d+(?:\.\d+)?)\s*%", lower)
             if pct_match:
-                params["feed_override_pct"] = float(pct_match.group(1))
-            return "reduce_feed", params
-        if "continue" in lower or "resume" in lower:
+                return "reduce_feed", {
+                    "feed_override_pct": float(pct_match.group(1))
+                }
+            return None, {}
+        if re.search(r"\b(continue|resume)\b", lower):
             return "continue", {}
         return None, {}
 
