@@ -110,6 +110,14 @@ _POLICY_ACTION_SCORES: dict[str, dict[str, float]] = {
         "continue": 0.4, "reduce_feed": 1.0,
         "rework": 0.3, "abort": 0.0, "replace_tool": 0.9,
     },
+    # J = w1·Tm + w2·C + w3·(1/L) + w4·S  (config.SCHED_W_* weights)
+    "multi_objective": {
+        "continue":     0.6,
+        "reduce_feed":  0.9,
+        "rework":       0.3,
+        "abort":        0.0,
+        "replace_tool": 0.8,
+    },
 }
 
 _RISK_PENALTY: dict[str, float] = {
@@ -836,6 +844,9 @@ class FactoryAgent:
             # use waypoints_due() to advance the G-code cursor in real sim-time
             # instead of advancing by one line per tick.
             job.toolpath_result   = tp
+            # Attach FeedsSpeedsResult so the GUI can display live telemetry
+            # (feed rate, RPM, spindle load) while the job is machining.
+            job.feeds_speeds      = fs
             # job.status remains "queued" only after enqueue_job() is called;
             # set a sentinel so callers can distinguish CAM-ready from queued.
             job.status = "cam_ready"

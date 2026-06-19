@@ -1,5 +1,5 @@
 """
-test_factory_agent.py — Phase 7 tests for factory_agent.py  (24 tests)
+test_factory_agent.py — Phase 7 tests for factory_agent.py  (27 tests)
 
  1. test_factory_created_with_agents
  2. test_shared_rework_queue
@@ -25,6 +25,9 @@ test_factory_agent.py — Phase 7 tests for factory_agent.py  (24 tests)
 22. test_summary_non_empty
 23. test_submit_new_seed_creates_job
 24. test_integration_full_factory_run
+25. test_multi_objective_policy_in_scores
+26. test_multi_objective_prefers_reduce_feed_over_continue
+27. test_build_job_attaches_feeds_speeds
 """
 
 from __future__ import annotations
@@ -304,6 +307,39 @@ class TestFactoryAgent(unittest.TestCase):
         print("\n[integration] 5-tick run")
         print(fa.summary())
         print("KPIs:", fa.get_production_kpis())
+
+    # 25
+    def test_multi_objective_policy_in_scores(self):
+        """multi_objective must be a key in _POLICY_ACTION_SCORES with all 5 actions."""
+        self.assertIn("multi_objective", _POLICY_ACTION_SCORES)
+        scores = _POLICY_ACTION_SCORES["multi_objective"]
+        for action in ("continue", "reduce_feed", "rework", "abort", "replace_tool"):
+            self.assertIn(action, scores, f"Missing action {action!r} in multi_objective")
+
+    # 26
+    def test_multi_objective_prefers_reduce_feed_over_continue(self):
+        """multi_objective balances cost/finish/life → reduce_feed > continue."""
+        fa  = _factory(policy="multi_objective")
+        r_f = fa._score_response(LLMResponse("e", "", "reduce_feed", risk_level="safe"))
+        r_c = fa._score_response(LLMResponse("f", "", "continue",    risk_level="safe"))
+        self.assertGreater(r_f.policy_score, r_c.policy_score,
+            f"multi_objective: reduce_feed {r_f.policy_score} should > continue {r_c.policy_score}")
+
+    # 27
+    def test_build_job_attaches_feeds_speeds(self):
+        """build_job_from_seed must attach a feeds_speeds attribute to the returned job."""
+        import os
+        npy = os.path.join(config.SOLID_OUTPUT_DIR, "solid_faces_seed_0.npy")
+        if not os.path.exists(npy):
+            self.skipTest("solid_faces_seed_0.npy not found")
+        fa  = _factory()
+        job = fa.build_job_from_seed(0)
+        self.assertIsNotNone(job)
+        self.assertTrue(hasattr(job, "feeds_speeds"),
+                        "Job is missing feeds_speeds attribute")
+        fs = job.feeds_speeds
+        self.assertGreater(fs.rpm, 0, "feeds_speeds.rpm must be > 0")
+        self.assertGreater(fs.feed_rate_mmpm, 0, "feeds_speeds.feed_rate_mmpm must be > 0")
 
 
 if __name__ == "__main__":
