@@ -405,6 +405,34 @@ class TestFactoryAgent(unittest.TestCase):
         self.assertEqual(rec["parameters"]["policy"], "multi_objective")
         self.assertEqual(fa.scheduler.policy, "multi_objective")
 
+    def test_operator_state_query_returns_machine_snapshot(self):
+        fa = _factory()
+        ag = fa.agents[1]
+        ag.current_job = _job(seed=7)
+        ag.status = "running"
+        rec = fa.handle_operator_input("M01", "What is the status of M02?")
+        self.assertTrue(rec["applied"])
+        self.assertEqual(rec["action"], "query_machine_state")
+        self.assertEqual(rec["parameters"]["machine_id"], "M02")
+        snapshot = rec["parameters"]["machine_state"]
+        self.assertEqual(snapshot["machine_id"], "M02")
+        self.assertEqual(snapshot["agent_status"], "running")
+        self.assertEqual(snapshot["current_job"], ag.current_job.job_id)
+        self.assertEqual(rec["context"]["category"], "query")
+
+    def test_operator_stop_production_stops_factory(self):
+        fa = _factory()
+        fa.scheduler.submit(_job(seed=10))
+        rec = fa.handle_operator_input("M01", "Stop production across the factory now")
+        self.assertTrue(rec["applied"])
+        self.assertEqual(rec["action"], "stop_production")
+        self.assertEqual(rec["context"]["category"], "production_control")
+        self.assertEqual(rec["parameters"]["machines"], ["M01", "M02", "M03", "M04"])
+        self.assertTrue(all(ag.status == "stopped" for ag in fa.agents))
+        self.assertTrue(all(m.status == "stopped" for m in fa.scheduler.machines))
+        fa.tick()
+        self.assertEqual(len(fa.scheduler.job_queue), 1)
+
 
 if __name__ == "__main__":
     loader = unittest.TestLoader()

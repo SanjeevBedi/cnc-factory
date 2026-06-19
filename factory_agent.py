@@ -247,7 +247,10 @@ class FactoryAgent:
         if agent is not None and active_error:
             action, params = self._parse_operator_override(clean_text)
         if action is None:
-            action, params = self._parse_operator_directive(clean_text)
+            action, params = self._parse_operator_directive(
+                clean_text,
+                default_machine_id=machine_id,
+            )
         context = self._build_operator_context(
             agent,
             clean_text,
@@ -377,11 +380,27 @@ class FactoryAgent:
         return None, {}
 
     @staticmethod
-    def _parse_operator_directive(text: str) -> tuple[Optional[str], dict]:
+    def _parse_operator_directive(
+        text: str,
+        default_machine_id: Optional[str] = None,
+    ) -> tuple[Optional[str], dict]:
         normalized = re.sub(r"[_-]+", " ", text.lower())
         normalized = re.sub(r"\s+", " ", normalized).strip()
         if not normalized:
             return None, {}
+        if (re.search(r"\b(stop|halt|pause)\b", normalized)
+                and re.search(r"\b(factory|production|line|shop)\b", normalized)):
+            return "stop_production", {}
+        target_match = re.search(r"\b(m\d{2})\b", text, re.IGNORECASE)
+        target_machine_id = (
+            target_match.group(1).upper()
+            if target_match else default_machine_id
+        )
+        if (target_machine_id
+                and re.search(r"\b(status|state|queue|summary|report)\b", normalized)
+                and re.search(r"\b(show|what(?:'s| is)?|query|report|state|status)\b",
+                              normalized)):
+            return "query_machine_state", {"machine_id": target_machine_id}
         if not re.search(
             r"\b(policy|schedule|scheduling|prioriti[sz]e|optimi[sz]e|focus)\b",
             normalized,
@@ -404,19 +423,59 @@ class FactoryAgent:
                 return "set_policy", {"policy": policy}
         return None, {}
 
+    def _machine_snapshot(self, machine_id: str) -> dict:
+        agent = next((ag for ag in self.agents if ag.machine_id == machine_id), None)
+        sched_machine = next(
+            (mach for mach in self.scheduler.machines if mach.machine_id == machine_id),
+            None,
+        )
+        state = agent.get_state() if agent is not None else {}
+        tool_life_pct = min(
+            (t["remaining_life_pct"] for t in state.get("tool_crib", [])),
+            default=100.0,
+        )
+        return {
+            "machine_id": machine_id,
+            "agent_status": state.get("status"),
+            "scheduler_status": sched_machine.status if sched_machine else None,
+            "current_job": state.get("current_job"),
+            "current_section": state.get("current_section"),
+            "queue_depth": state.get("queue_depth"),
+            "tool_life_pct": tool_life_pct,
+            "active_error": state.get("active_error"),
+        }
+
     def _apply_operator_directive(
         self,
         action: Optional[str],
         params: dict,
     ) -> bool:
-        if action != "set_policy":
-            return False
-        policy = str(params.get("policy", ""))
-        if policy not in VALID_POLICIES:
-            return False
-        self.policy = policy
-        self.scheduler.policy = policy
-        return True
+        if action == "set_policy":
+            policy = str(params.get("policy", ""))
+            if policy not in VALID_POLICIES:
+                return False
+            self.policy = policy
+            self.scheduler.policy = policy
+            return True
+        if action == "query_machine_state":
+            target_machine_id = str(params.get("machine_id", ""))
+            if not target_machine_id:
+                return False
+            params["machine_state"] = self._machine_snapshot(target_machine_id)
+            return True
+        if action == "stop_production":
+            stopped = []
+            for sched_machine in self.scheduler.machines:
+                sched_machine.status = "stopped"
+                stopped.append(sched_machine.machine_id)
+            for agent in self.agents:
+                if agent.active_error is not None:
+                    agent.active_error.factory_response = "abort"
+                    agent.active_error.resolved = True
+                agent.status = "stopped"
+            params["machines"] = stopped
+            return True
+        return False
 
     @staticmethod
     def _build_operator_context(
@@ -437,6 +496,10 @@ class FactoryAgent:
 
         if action == "set_policy":
             category = "policy"
+        elif action == "query_machine_state":
+            category = "query"
+        elif action == "stop_production":
+            category = "production_control"
         elif any(word in lower for word in ("chatter", "vibration", "resonance")):
             category = "vibration"
         elif any(word in lower for word in ("collision", "crash", "impact")):

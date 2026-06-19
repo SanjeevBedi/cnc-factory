@@ -2391,9 +2391,14 @@ class FactoryGUI(tk.Tk):
             panel.update_state(agent.get_state())
         if panel and panel._chat and panel._chat.winfo_exists():
             if record["applied"]:
+                applied_label = (
+                    "override"
+                    if record["context"]["event_type"] == "operator_override"
+                    else "command"
+                )
                 panel._chat.append(
                     "confirm",
-                    f"Applied operator override: {record['action']}",
+                    f"Applied operator {applied_label}: {record['action']}",
                 )
             elif record["active_error"]:
                 panel._chat.append(
@@ -2405,8 +2410,13 @@ class FactoryGUI(tk.Tk):
 
         if record["applied"]:
             tag = "warn" if record["action"] in ("abort", "rework") else "ok"
+            action_label = (
+                "operator override"
+                if record["context"]["event_type"] == "operator_override"
+                else "operator command"
+            )
             self._fpanel.log(
-                f"👤 {mid} operator override → {record['action']}",
+                f"👤 {mid} {action_label} → {record['action']}",
                 tag,
             )
         else:
