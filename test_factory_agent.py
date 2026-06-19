@@ -398,6 +398,13 @@ class TestFactoryAgent(unittest.TestCase):
             "operator_directive",
         )
 
+    def test_operator_policy_directive_accepts_multiobjective_alias(self):
+        fa = _factory()
+        rec = fa.handle_operator_input("M03", "Prioritize the multiobjective schedule")
+        self.assertTrue(rec["applied"])
+        self.assertEqual(rec["parameters"]["policy"], "multi_objective")
+        self.assertEqual(fa.scheduler.policy, "multi_objective")
+
 
 if __name__ == "__main__":
     loader = unittest.TestLoader()

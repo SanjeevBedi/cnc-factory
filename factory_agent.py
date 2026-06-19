@@ -397,6 +397,7 @@ class FactoryAgent:
             "max tool life": "max_tool_life",
             "maximum tool life": "max_tool_life",
             "multi objective": "multi_objective",
+            "multiobjective": "multi_objective",
         }
         for alias, policy in aliases.items():
             if alias in normalized:
