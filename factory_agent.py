@@ -282,7 +282,7 @@ class FactoryAgent:
                 if operator_note.lower() not in desc.lower():
                     agent.active_error.description = f"{desc}{operator_note}"
 
-        if action not in _OPERATOR_OVERRIDE_ACTIONS:
+        if action is not None and action not in _OPERATOR_OVERRIDE_ACTIONS:
             if self._apply_operator_directive(action, params):
                 record["applied"] = True
                 record["action"] = action
