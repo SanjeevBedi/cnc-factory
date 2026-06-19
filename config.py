@@ -30,10 +30,10 @@ except Exception:
 _HERE = os.path.dirname(os.path.abspath(__file__))
 
 SOLID_OUTPUT_DIR: str = os.path.join(
-    "/Users/sbedi/Nextcloud/Python/Solid/random_solids", "Output"
+    "/Users/sbedi/Desktop/random_solids", "Output"
 )
 BUILD_SOLID_SCRIPT: str = os.path.join(
-    "/Users/sbedi/Nextcloud/Python/Solid/random_solids", "Build_Solid.py"
+    "/Users/sbedi/Desktop/random_solids", "Build_Solid.py"
 )
 CNC_FACTORY_DIR: str = _HERE
 

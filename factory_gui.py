@@ -62,7 +62,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 import tkinter as tk
-from tkinter import ttk, scrolledtext, messagebox, simpledialog
+from tkinter import ttk, scrolledtext, messagebox, simpledialog, filedialog
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -1131,11 +1131,50 @@ class FactoryGUI(tk.Tk):
         # ── Build (or refresh) the indexed library ─────────────────────────
         available = bridge.list_available_seeds()   # sorted list of int seeds
         if not available:
-            from tkinter import messagebox
-            messagebox.showwarning(
-                "No Seeds",
-                f"No .npy files found in:\n{config.SOLID_OUTPUT_DIR}")
-            return
+            msg = (
+                "No seed files were found in:\n"
+                f"{config.SOLID_OUTPUT_DIR}\n\n"
+                "Choose another folder that contains files named like:\n"
+                "solid_faces_seed_0.npy"
+            )
+            pick_other = messagebox.askyesno(
+                "No Seeds Found",
+                msg,
+                icon="warning",
+            )
+            if pick_other:
+                chosen = filedialog.askdirectory(
+                    title="Select Seed Output Folder",
+                    initialdir=os.path.expanduser("~"),
+                    mustexist=True,
+                    parent=self,
+                )
+                if chosen:
+                    prev_dir = config.SOLID_OUTPUT_DIR
+                    config.SOLID_OUTPUT_DIR = chosen
+                    available = bridge.list_available_seeds()
+                    if available:
+                        self._fpanel.log(
+                            f"Seed folder set to: {config.SOLID_OUTPUT_DIR}",
+                            "ok",
+                        )
+                    else:
+                        config.SOLID_OUTPUT_DIR = prev_dir
+                        messagebox.showwarning(
+                            "No Seeds In Folder",
+                            "That folder does not contain any seed files.\n\n"
+                            "Expected names like:\n"
+                            "solid_faces_seed_0.npy",
+                        )
+
+            if not available:
+                messagebox.showwarning(
+                    "No Seeds",
+                    "No seeds loaded.\n\n"
+                    "Generate or copy .npy seed files first, then press Load Seeds again.\n\n"
+                    f"Current seed folder:\n{config.SOLID_OUTPUT_DIR}",
+                )
+                return
 
         self._seed_index   = available           # index 0 … N-1
         self._seed_max_idx = len(available) - 1  # inclusive upper bound
