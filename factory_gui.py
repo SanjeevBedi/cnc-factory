@@ -553,6 +553,27 @@ class MachinePanel(ttk.Frame):
                                    fg=FG, font=("Courier", 8))
         self._life_lbl.pack(side="left")
 
+        # ── telemetry row (PDF §8.3.1 — feed, RPM, spindle load) ──────────
+        tm = tk.Frame(self, bg=PNL)
+        tm.pack(fill="x", padx=2, pady=1)
+        tk.Label(tm, text="F:", bg=PNL, fg=DIM,
+                 font=("Courier", 8)).pack(side="left", padx=(4, 1))
+        self._feed_lbl = tk.Label(tm, text="—", bg=PNL, fg=DIM,
+                                   font=("Courier", 8))
+        self._feed_lbl.pack(side="left")
+        tk.Label(tm, text="mm/min", bg=PNL, fg=DIM,
+                 font=("Courier", 8)).pack(side="left", padx=(1, 6))
+        tk.Label(tm, text="RPM:", bg=PNL, fg=DIM,
+                 font=("Courier", 8)).pack(side="left")
+        self._rpm_lbl = tk.Label(tm, text="—", bg=PNL, fg=DIM,
+                                  font=("Courier", 8))
+        self._rpm_lbl.pack(side="left", padx=(1, 6))
+        tk.Label(tm, text="Load:", bg=PNL, fg=DIM,
+                 font=("Courier", 8)).pack(side="left")
+        self._load_lbl = tk.Label(tm, text="—", bg=PNL, fg=DIM,
+                                   font=("Courier", 8))
+        self._load_lbl.pack(side="left", padx=(1, 4))
+
         # ── g-code scroll ─────────────────────────────────────────────────
         gc_frm = tk.Frame(self, bg=BG)
         gc_frm.pack(fill="x", padx=2)
@@ -683,6 +704,21 @@ class MachinePanel(ttk.Frame):
     def update_tool_label(self, tool_id: str, dia: float) -> None:
         self._tool_lbl.configure(text=f"{tool_id} ⌀{dia:.0f}mm")
 
+    def update_telemetry(self, fs) -> None:
+        """Display live feed rate, RPM, and spindle load from a FeedsSpeedsResult."""
+        power_limit = config.MACHINE_POWER_LIMIT_KW   # always > 0 (config default 7.5 kW)
+        load_pct    = min(100.0, fs.power_kw / power_limit * 100.0)
+        load_fg = (RED if load_pct >= 90 else ORANGE if load_pct >= 70 else GREEN)
+        self._feed_lbl.configure(text=f"{fs.feed_rate_mmpm:.0f}", fg=FG)
+        self._rpm_lbl.configure(text=f"{fs.rpm:.0f}", fg=FG)
+        self._load_lbl.configure(text=f"{load_pct:.0f}%", fg=load_fg)
+
+    def clear_telemetry(self) -> None:
+        """Reset telemetry display when the machine returns to idle."""
+        self._feed_lbl.configure(text="—", fg=DIM)
+        self._rpm_lbl.configure(text="—", fg=DIM)
+        self._load_lbl.configure(text="—", fg=DIM)
+
     def append_chat(self, speaker_key: str, text: str,
                     tag: str = "system") -> None:
         if self._chat and self._chat.winfo_exists():
@@ -773,7 +809,8 @@ class FactoryPanel(ttk.Frame):
         tk.Label(pf, text="Policy:", bg=PNL, fg=DIM,
                  font=("Courier", 9)).pack(side="left", padx=4)
         self._policy_var = tk.StringVar(value="min_time")
-        policies = ["min_time", "min_cost", "best_finish", "max_tool_life"]
+        policies = ["min_time", "min_cost", "best_finish", "max_tool_life",
+                    "multi_objective"]
         om = ttk.OptionMenu(pf, self._policy_var, "min_time", *policies,
                             command=self._on_policy)
         om.pack(side="left")
@@ -1220,6 +1257,11 @@ class FactoryGUI(tk.Tk):
 
             self._msim[dest].queue.append(job)   # enqueue to pre-chosen machine
 
+            # Update pipeline monitor with the actual machine assignment
+            win = self._pipeline_wins.get(seed)
+            if win and win.winfo_exists():
+                win.progress(seed, "machine", f"Assigned → {dest}")
+
             self._fpanel.log(
                 f"📄 Seed {seed}  G-code ready  "
                 f"({len(job.gcode_lines)} lines)  →  {dest}",
@@ -1661,6 +1703,9 @@ class FactoryGUI(tk.Tk):
                 msim.mach_start_tick = cur_tick   # record when cutting begins
                 if panel:
                     panel.set_machining_label(msim.current_job.seed, "▶")
+                    fs = getattr(msim.current_job, "feeds_speeds", None)
+                    if fs is not None:
+                        panel.update_telemetry(fs)
                 self._eq.put(GuiEvent("gcode_step", mid,
                                       {"lines": msim.gcode_lines, "cursor": 0}))
 
@@ -1720,6 +1765,7 @@ class FactoryGUI(tk.Tk):
                 msim.status       = "idle"
                 if panel:
                     panel.set_idle_label()
+                    panel.clear_telemetry()
 
     def _auto_seed_tick(self) -> None:
         """
@@ -1799,6 +1845,11 @@ class FactoryGUI(tk.Tk):
                 return
 
             self._msim[dest].queue.append(job)   # enqueue to pre-chosen machine
+
+            # Update pipeline monitor with the actual machine assignment
+            win = self._pipeline_wins.get(seed)
+            if win and win.winfo_exists():
+                win.progress(seed, "machine", f"Assigned → {dest}")
 
             self._fpanel.log(
                 f"📄 Auto-seed {seed}  G-code ready  "

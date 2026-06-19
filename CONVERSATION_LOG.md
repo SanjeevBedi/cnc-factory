@@ -1,5 +1,5 @@
 # CNC Factory — Conversation Log & Session Memory
-> Last updated: Session 4 (Toolpath loop fix + Completed Parts + Auto-seed generation)
+> Last updated: Session 5 (Machine telemetry + multi_objective policy + pipeline monitor machine assignment)
 > Purpose: Recall context, decisions, and progress across chat sessions.
 
 ---
@@ -222,8 +222,40 @@ When a disturbance is injected on a machine, the `AgentConversationWindow` shows
 | Visual comparison: seed solid vs machined part | ❌ Not built | Mentioned in Session 1 — side-by-side 3D viewer using matplotlib |
 | 3D simulator connection for all 4 machines | ⚠ Partial | `[3D↗]` button exists, needs 4× cnc_sim_api_server.py instances on ports 8001-8004 |
 | `generate_if_missing=True` pipeline path | ✅ Built | `submit_new_seed(..., generate_if_missing=True)` calls Build_Solid.py |
-| Pipeline monitor "machine assigned" update | ⚠ Partial | Shows "queued" — actual machine assignment happens on next tick |
-| Run all unit tests | ⚠ Not run this session | `python -m pytest test_*.py -v` |
+| Pipeline monitor "machine assigned" update | ✅ Done | `_load_seeds_thread` and `_auto_seed_thread` now call `win.progress(seed, "machine", f"Assigned → {dest}")` after enqueueing |
+| Machine telemetry display (PDF §8.3.1) | ✅ Done | MachinePanel telemetry row shows live F (mm/min), RPM, and Load% during machining |
+| `multi_objective` policy in factory GUI | ✅ Done | Added to FactoryPanel dropdown; `_POLICY_ACTION_SCORES` entry added in factory_agent.py |
+| Run all unit tests | ✅ Passing | 183 passed, 10 skipped — `python -m pytest` |
+
+---
+
+## Session 5 — Machine telemetry + multi_objective policy + pipeline monitor machine assignment
+
+### What was built
+
+| Feature | Description | Files changed |
+|---------|-------------|---------------|
+| Machine telemetry row | Telemetry row in each MachinePanel showing live F (feed rate, mm/min), RPM, and spindle Load% during machining. Values from `job.feeds_speeds` (FeedsSpeedsResult). Load% = `power_kw / MACHINE_POWER_LIMIT_KW × 100`. Colour: green <70%, orange <90%, red ≥90%. Cleared to `—` when machine returns to idle. | `factory_gui.py` |
+| Pipeline monitor machine assignment | After `_load_seeds_thread` / `_auto_seed_thread` enqueues a job to a specific machine, `win.progress(seed, "machine", f"Assigned → {dest}")` is called so the 🏭 Machine stage shows the real machine ID. | `factory_gui.py` |
+| `multi_objective` policy | Added `"multi_objective"` to `_POLICY_ACTION_SCORES` in `factory_agent.py` with balanced scores (reduce_feed 0.9, replace_tool 0.8, continue 0.6). Added to `FactoryPanel` policy dropdown. Implements the `J = w1·Tm + w2·C + w3·(1/L) + w4·S` cost function from the PDF plan. | `factory_agent.py`, `factory_gui.py` |
+| `job.feeds_speeds` | `build_job_from_seed()` now attaches the `FeedsSpeedsResult` as `job.feeds_speeds` so the GUI can read RPM/feed during machining. | `factory_agent.py` |
+| Tests 25–27 | Three new unit tests: `test_multi_objective_policy_in_scores`, `test_multi_objective_prefers_reduce_feed_over_continue`, `test_build_job_attaches_feeds_speeds`. | `test_factory_agent.py` |
+
+### How telemetry works
+1. `build_job_from_seed()` attaches `job.feeds_speeds = fs` (FeedsSpeedsResult)
+2. `_tick_machine()`: when `setup → machining` transition occurs, calls `panel.update_telemetry(fs)`
+3. `update_telemetry(fs)`: sets `_feed_lbl`, `_rpm_lbl`, `_load_lbl` from `fs.feed_rate_mmpm`, `fs.rpm`, and `min(100, fs.power_kw / config.MACHINE_POWER_LIMIT_KW * 100)`
+4. `_tick_machine()`: when `unclamp → idle` transition occurs, calls `panel.clear_telemetry()` → resets to `—`
+
+### Test results
+```
+183 passed, 10 skipped, 10 subtests passed
+```
+
+### Files changed in Session 5
+- `factory_agent.py` — added `multi_objective` to `_POLICY_ACTION_SCORES`; attached `job.feeds_speeds = fs` in `build_job_from_seed()`
+- `factory_gui.py` — telemetry row in `MachinePanel.__init__`; `update_telemetry()` / `clear_telemetry()` methods; `_tick_machine()` calls both; pipeline monitor machine assignment in `_load_seeds_thread` and `_auto_seed_thread`; added `multi_objective` to policy dropdown
+- `test_factory_agent.py` — tests 25–27 added
 
 ---
 
@@ -306,7 +338,6 @@ Tell the assistant:
 > "Read CONVERSATION_LOG.md and resume from there."
 
 Then describe what you want to work on next. Suggested next steps:
-1. **Run the GUI** — `python factory_gui.py` and test the full demo flow
-2. **Part comparison window** — seed solid vs machined result, side-by-side 3D
-3. **4× simulator instances** — wire up cnc_sim_api_server.py on ports 8001–8004
-4. **Pipeline monitor "assigned" update** — post machine assignment back to the monitor window after the scheduler tick assigns the job
+1. **Run the GUI** — `python factory_gui.py` and verify telemetry row on each machine, pipeline monitor "Assigned → MXX" label, and multi_objective policy in dropdown
+2. **Part comparison window** — seed solid vs machined result, side-by-side 3D viewer using matplotlib/vtk
+3. **4× simulator instances** — wire up cnc_sim_api_server.py on ports 8001–8004 so `[3D↗]` button launches real simulation windows
