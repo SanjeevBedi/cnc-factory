@@ -21,6 +21,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import re
 import uuid
 from collections import deque
 from dataclasses import dataclass, field
@@ -155,6 +156,7 @@ class FactoryAgent:
         self.tool_inventory: dict[str, list[ToolRecord]] = {}
         self._seed_inventory()
         self.command_log: list[FactoryCommand] = []
+        self.operator_feedback_log: list[dict] = []
 
         self.total_errors_processed = 0
         self.total_tools_replaced   = 0
@@ -224,6 +226,42 @@ class FactoryAgent:
     def run(self, n_ticks: int) -> list[FactoryTickResult]:
         return [self.tick() for _ in range(n_ticks)]
 
+    def handle_operator_input(
+        self,
+        machine_id: str,
+        text: str,
+        tick_num: Optional[int] = None,
+    ) -> dict:
+        agent = next((ag for ag in self.agents if ag.machine_id == machine_id), None)
+        clean_text = text.strip()
+        active_error = bool(agent and agent.status == "awaiting_factory"
+                            and agent.active_error is not None)
+
+        record = {
+            "machine_id": machine_id,
+            "tick": self.scheduler.tick if tick_num is None else tick_num,
+            "text": clean_text,
+            "active_error": active_error,
+            "applied": False,
+            "action": "",
+            "parameters": {},
+        }
+
+        if agent is not None and active_error:
+            action, params = self._parse_operator_override(clean_text)
+            if action is not None:
+                agent.handle_factory_response({"action": action, **params})
+                record["applied"] = True
+                record["action"] = action
+                record["parameters"] = dict(params)
+            elif clean_text:
+                desc = agent.active_error.description
+                if clean_text.lower() not in desc.lower():
+                    agent.active_error.description = f"{desc} | operator: {clean_text}"
+
+        self.operator_feedback_log.append(record)
+        return record
+
     # ── Error processing ------------------------------------------------------
 
     def _process_errors(self, tick_num: int) -> list[FactoryCommand]:
@@ -287,6 +325,23 @@ class FactoryAgent:
             factory_policy     = self.policy,
             tick               = tick_num,
         )
+
+    @staticmethod
+    def _parse_operator_override(text: str) -> tuple[Optional[str], dict]:
+        lower = text.lower()
+        pct_match = re.search(r"(\d+(?:\.\d+)?)\s*%", lower)
+        if "abort" in lower or "stop" in lower:
+            return "abort", {}
+        if "rework" in lower:
+            return "rework", {}
+        if "reduce" in lower or "slow" in lower:
+            params = {}
+            if pct_match:
+                params["feed_override_pct"] = float(pct_match.group(1))
+            return "reduce_feed", params
+        if "continue" in lower or "resume" in lower:
+            return "continue", {}
+        return None, {}
 
     # ── LLM ------------------------------------------------------------------
 
@@ -940,6 +995,7 @@ class FactoryAgent:
             "scheduler":          self.scheduler.state_dict(),
             "agents":             [ag.get_state() for ag in self.agents],
             "rework_queue_depth": len(self.rework_queue),
+            "operator_feedback_log": list(self.operator_feedback_log),
             "tool_inventory":     {tid: len(st)
                                    for tid, st in self.tool_inventory.items()},
             "kpis":               self.get_production_kpis(),
@@ -965,6 +1021,7 @@ class FactoryAgent:
             "total_jobs_completed":      self.total_jobs_completed,
             "total_errors_processed":    self.total_errors_processed,
             "total_tools_replaced":      self.total_tools_replaced,
+            "operator_interventions":    len(self.operator_feedback_log),
             "rework_queue_depth":        len(self.rework_queue),
             "avg_tool_life_pct":         round(avg_life, 1),
             "scheduler_queue_depth":     len(self.scheduler.job_queue),
@@ -985,7 +1042,8 @@ class FactoryAgent:
             f"{kpis['rework_queue_depth']} rework  "
             f"{kpis['scheduler_queue_depth']} queued",
             f"  Errors   : {kpis['total_errors_processed']} processed  "
-            f"  Tools replaced: {kpis['total_tools_replaced']}",
+            f"  Tools replaced: {kpis['total_tools_replaced']}  "
+            f"Operator notes: {kpis['operator_interventions']}",
             f"  Avg tool life : {kpis['avg_tool_life_pct']:.1f}%",
         ]
         for ag in self.agents:

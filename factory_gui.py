@@ -2383,6 +2383,35 @@ class FactoryGUI(tk.Tk):
                 )
 
     # ── Misc ──────────────────────────────────────────────────────────────────
+    def handle_operator_input(self, mid: str, text: str) -> None:
+        record = self.fa.handle_operator_input(mid, text)
+        agent = next((a for a in self.fa.agents if a.machine_id == mid), None)
+        panel = self._panels.get(mid)
+        if panel and agent is not None:
+            panel.update_state(agent.get_state())
+        if panel and panel._chat and panel._chat.winfo_exists():
+            if record["applied"]:
+                panel._chat.append(
+                    "confirm",
+                    f"Applied operator override: {record['action']}",
+                )
+            elif record["active_error"]:
+                panel._chat.append(
+                    "system",
+                    "Operator context attached to the active error.",
+                )
+            else:
+                panel._chat.append("system", "Operator note recorded.")
+
+        if record["applied"]:
+            tag = "warn" if record["action"] in ("abort", "rework") else "ok"
+            self._fpanel.log(
+                f"👤 {mid} operator override → {record['action']}",
+                tag,
+            )
+        else:
+            self._fpanel.log(f"👤 {mid} operator note recorded", "ok")
+
     def _set_key(self) -> None:
         key = simpledialog.askstring(
             "OpenAI API Key",

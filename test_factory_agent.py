@@ -1,5 +1,5 @@
 """
-test_factory_agent.py — Phase 7 tests for factory_agent.py  (24 tests)
+test_factory_agent.py — Phase 7 tests for factory_agent.py  (27 tests)
 
  1. test_factory_created_with_agents
  2. test_shared_rework_queue
@@ -25,6 +25,9 @@ test_factory_agent.py — Phase 7 tests for factory_agent.py  (24 tests)
 22. test_summary_non_empty
 23. test_submit_new_seed_creates_job
 24. test_integration_full_factory_run
+25. test_operator_context_appended_to_error
+26. test_operator_override_applies_abort
+27. test_operator_feedback_visible_in_state
 """
 
 from __future__ import annotations
@@ -243,7 +246,7 @@ class TestFactoryAgent(unittest.TestCase):
             "machines_running","machines_idle",
             "machines_awaiting_factory","machines_stopped",
             "total_jobs_completed","total_errors_processed",
-            "total_tools_replaced","rework_queue_depth",
+            "total_tools_replaced","operator_interventions","rework_queue_depth",
             "avg_tool_life_pct","scheduler_queue_depth",
         ):
             self.assertIn(key, kpis, f"Missing KPI: {key!r}")
@@ -304,6 +307,47 @@ class TestFactoryAgent(unittest.TestCase):
         print("\n[integration] 5-tick run")
         print(fa.summary())
         print("KPIs:", fa.get_production_kpis())
+
+    # 25
+    def test_operator_context_appended_to_error(self):
+        fa = _factory()
+        ag = fa.agents[0]
+        ag.current_job = _job()
+        ag.inject_error("tool chatter detected")
+        rec = fa.handle_operator_input("M01", "Check vise clamp near jaw 2")
+        self.assertFalse(rec["applied"])
+        self.assertIn("operator: Check vise clamp near jaw 2",
+                      ag.active_error.description)
+        self.assertEqual(ag.status, "awaiting_factory")
+
+    # 26
+    def test_operator_override_applies_abort(self):
+        fa = _factory()
+        ag = fa.agents[0]
+        ag.current_job = _job()
+        ag.inject_error("collision risk imminent")
+        rec = fa.handle_operator_input("M01", "Abort the job now")
+        self.assertTrue(rec["applied"])
+        self.assertEqual(rec["action"], "abort")
+        self.assertEqual(ag.status, "stopped")
+        self.assertIsNotNone(ag.active_error)
+        self.assertTrue(ag.active_error.resolved)
+
+    # 27
+    def test_operator_feedback_visible_in_state(self):
+        fa = _factory()
+        ag = fa.agents[0]
+        ag.current_job = _job()
+        ag.inject_error("vibration detected")
+        fa.handle_operator_input("M01", "Reduce feed to 65%")
+        state = fa.get_factory_state()
+        self.assertEqual(len(state["operator_feedback_log"]), 1)
+        self.assertEqual(state["operator_feedback_log"][0]["action"], "reduce_feed")
+        self.assertEqual(
+            state["operator_feedback_log"][0]["parameters"]["feed_override_pct"],
+            65.0,
+        )
+        json.dumps(state)
 
 
 if __name__ == "__main__":

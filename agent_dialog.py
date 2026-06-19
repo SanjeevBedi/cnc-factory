@@ -378,12 +378,7 @@ class AgentConversationWindow(tk.Toplevel):
             return
         self._entry.delete(0, "end")
         self.append("operator", txt)
-        # relay to factory as a manual override
-        self._app._eq.put({
-            "kind": "operator_input",
-            "mid":  self._mid,
-            "text": txt,
-        })
+        self._app.handle_operator_input(self._mid, txt)
 
     def _export(self) -> None:
         path = filedialog.asksaveasfilename(
