@@ -21,6 +21,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import re
 import uuid
 from collections import deque
 from dataclasses import dataclass, field
@@ -32,7 +33,7 @@ from cnc_agent import (
     build_default_crib,
     _MACHINE_TOOL_DATA,
 )
-from scheduler import Scheduler, Job, make_job
+from scheduler import Scheduler, Job, make_job, VALID_POLICIES
 
 # optional OpenAI
 try:
@@ -67,6 +68,7 @@ class ErrorContext:
     queue_depth:        int
     factory_policy:     str
     tick:               int
+    operator_context:   dict = field(default_factory=dict)
 
 
 @dataclass
@@ -116,6 +118,10 @@ _RISK_PENALTY: dict[str, float] = {
     "safe": 0.0, "risky": -0.1, "catastrophic": -0.5,
 }
 
+_OPERATOR_OVERRIDE_ACTIONS = frozenset(
+    {"continue", "reduce_feed", "rework", "abort"}
+)
+
 
 # ── Factory Agent -------------------------------------------------------------
 
@@ -155,6 +161,9 @@ class FactoryAgent:
         self.tool_inventory: dict[str, list[ToolRecord]] = {}
         self._seed_inventory()
         self.command_log: list[FactoryCommand] = []
+        self.operator_feedback_log: list[dict] = []
+        self.operator_context_by_machine: dict[str, dict] = {}
+        self.operator_stopped_machines: set[str] = set()
 
         self.total_errors_processed = 0
         self.total_tools_replaced   = 0
@@ -224,6 +233,68 @@ class FactoryAgent:
     def run(self, n_ticks: int) -> list[FactoryTickResult]:
         return [self.tick() for _ in range(n_ticks)]
 
+    def handle_operator_input(
+        self,
+        machine_id: str,
+        text: str,
+        tick_num: Optional[int] = None,
+    ) -> dict:
+        agent = next((ag for ag in self.agents if ag.machine_id == machine_id), None)
+        clean_text = text.strip()
+        active_error = bool(agent and agent.status == "awaiting_factory"
+                            and agent.active_error is not None)
+        action: Optional[str] = None
+        params: dict = {}
+        if agent is not None and active_error:
+            action, params = self._parse_operator_override(clean_text)
+        if action is None:
+            action, params = self._parse_operator_directive(
+                clean_text,
+                default_machine_id=machine_id,
+            )
+        context = self._build_operator_context(
+            agent,
+            clean_text,
+            active_error=active_error,
+            action=action,
+            params=params,
+        )
+
+        record = {
+            "machine_id": machine_id,
+            "tick": self.scheduler.tick if tick_num is None else tick_num,
+            "text": clean_text,
+            "active_error": active_error,
+            "applied": False,
+            "action": "",
+            "parameters": {},
+            "context": context,
+        }
+
+        if clean_text:
+            self.operator_context_by_machine[machine_id] = dict(context)
+
+        if agent is not None and active_error:
+            if action in _OPERATOR_OVERRIDE_ACTIONS:
+                agent.handle_factory_response({"action": action, **params})
+                record["applied"] = True
+                record["action"] = action
+                record["parameters"] = dict(params)
+            elif clean_text:
+                desc = agent.active_error.description
+                operator_note = f" | operator: {clean_text}"
+                if operator_note.lower() not in desc.lower():
+                    agent.active_error.description = f"{desc}{operator_note}"
+
+        if action is not None and action not in _OPERATOR_OVERRIDE_ACTIONS:
+            if self._apply_operator_directive(action, params):
+                record["applied"] = True
+                record["action"] = action
+                record["parameters"] = dict(params)
+
+        self.operator_feedback_log.append(record)
+        return record
+
     # ── Error processing ------------------------------------------------------
 
     def _process_errors(self, tick_num: int) -> list[FactoryCommand]:
@@ -286,7 +357,220 @@ class FactoryAgent:
             queue_depth        = state["queue_depth"],
             factory_policy     = self.policy,
             tick               = tick_num,
+            operator_context   = dict(
+                self.operator_context_by_machine.get(agent.machine_id, {})
+            ),
         )
+
+    @staticmethod
+    def _parse_operator_override(text: str) -> tuple[Optional[str], dict]:
+        lower = text.lower()
+        if re.search(r"\b(abort|stop)\b", lower):
+            return "abort", {}
+        if re.search(r"\brework\b", lower):
+            return "rework", {}
+        if re.search(r"\b(reduce|slow)\b", lower):
+            pct_match = re.search(r"(\d+(?:\.\d+)?)\s*%", lower)
+            if pct_match:
+                return "reduce_feed", {
+                    "feed_override_pct": float(pct_match.group(1))
+                }
+            return None, {}
+        if re.search(r"\b(continue|resume)\b", lower):
+            return "continue", {}
+        return None, {}
+
+    @staticmethod
+    def _parse_operator_directive(
+        text: str,
+        default_machine_id: Optional[str] = None,
+    ) -> tuple[Optional[str], dict]:
+        normalized = re.sub(r"[_-]+", " ", text.lower())
+        normalized = re.sub(r"\s+", " ", normalized).strip()
+        if not normalized:
+            return None, {}
+        if (re.search(r"\b(stop|halt|pause)\b", normalized)
+                and re.search(r"\b(factory|production|line|shop)\b", normalized)):
+            return "stop_production", {}
+        if (re.search(r"\b(resume|restart|start|continue)\b", normalized)
+                and re.search(r"\b(factory|production|line|shop)\b", normalized)):
+            return "resume_production", {}
+        target_match = re.search(r"\b(m\d{2})\b", text, re.IGNORECASE)
+        target_machine_id = (
+            target_match.group(1).upper()
+            if target_match else default_machine_id
+        )
+        if (target_machine_id
+                and re.search(r"\b(status|state|queue|summary|report)\b", normalized)
+                and re.search(r"\b(show|what(?:'s| is)?|query)\b", normalized)):
+            return "query_machine_state", {"machine_id": target_machine_id}
+        if not re.search(
+            r"\b(policy|schedule|scheduling|prioriti[sz]e|optimi[sz]e|focus)\b",
+            normalized,
+        ):
+            return None, {}
+
+        aliases = {
+            "min time": "min_time",
+            "minimum time": "min_time",
+            "min cost": "min_cost",
+            "minimum cost": "min_cost",
+            "best finish": "best_finish",
+            "max tool life": "max_tool_life",
+            "maximum tool life": "max_tool_life",
+            "multi objective": "multi_objective",
+            "multiobjective": "multi_objective",
+        }
+        for alias, policy in aliases.items():
+            if alias in normalized:
+                return "set_policy", {"policy": policy}
+        return None, {}
+
+    def _machine_snapshot(self, machine_id: str) -> dict:
+        agent = next((ag for ag in self.agents if ag.machine_id == machine_id), None)
+        sched_machine = next(
+            (mach for mach in self.scheduler.machines if mach.machine_id == machine_id),
+            None,
+        )
+        state = agent.get_state() if agent is not None else {}
+        tool_life_pct = min(
+            (t["remaining_life_pct"] for t in state.get("tool_crib", [])),
+            default=100.0,
+        )
+        return {
+            "machine_id": machine_id,
+            "agent_status": state.get("status"),
+            "scheduler_status": sched_machine.status if sched_machine else None,
+            "current_job": state.get("current_job"),
+            "current_section": state.get("current_section"),
+            "queue_depth": state.get("queue_depth"),
+            "tool_life_pct": tool_life_pct,
+            "active_error": state.get("active_error"),
+        }
+
+    def _apply_operator_directive(
+        self,
+        action: Optional[str],
+        params: dict,
+    ) -> bool:
+        if action == "set_policy":
+            policy = str(params.get("policy", ""))
+            if policy not in VALID_POLICIES:
+                return False
+            self.policy = policy
+            self.scheduler.policy = policy
+            return True
+        if action == "query_machine_state":
+            target_machine_id = str(params.get("machine_id", ""))
+            if not target_machine_id:
+                return False
+            params["machine_state"] = self._machine_snapshot(target_machine_id)
+            return True
+        if action == "stop_production":
+            stopped = []
+            for sched_machine in self.scheduler.machines:
+                sched_machine.status = "stopped"
+                stopped.append(sched_machine.machine_id)
+            for agent in self.agents:
+                if agent.active_error is not None:
+                    agent.active_error.factory_response = "abort"
+                    agent.active_error.resolved = True
+                agent.status = "stopped"
+            self.operator_stopped_machines = set(stopped)
+            params["machines"] = stopped
+            return True
+        if action == "resume_production":
+            resumed = []
+            for sched_machine in self.scheduler.machines:
+                if sched_machine.machine_id not in self.operator_stopped_machines:
+                    continue
+                sched_machine.status = (
+                    "running" if sched_machine.current_job is not None else "idle"
+                )
+                resumed.append(sched_machine.machine_id)
+            for agent in self.agents:
+                if agent.machine_id not in self.operator_stopped_machines:
+                    continue
+                if (agent.active_error is not None
+                        and agent.active_error.resolved
+                        and agent.active_error.factory_response == "abort"):
+                    agent.active_error = None
+                agent.status = "running" if agent.current_job is not None else "idle"
+            self.operator_stopped_machines.clear()
+            params["machines"] = resumed
+            return bool(resumed)
+        return False
+
+    @staticmethod
+    def _build_operator_context(
+        agent: Optional[CncAgent],
+        text: str,
+        *,
+        active_error: bool,
+        action: Optional[str],
+        params: dict,
+    ) -> dict:
+        lower = text.lower()
+        category = "general"
+        event_type = "operator_note"
+        if action in _OPERATOR_OVERRIDE_ACTIONS:
+            event_type = "operator_override"
+        elif action is not None:
+            event_type = "operator_directive"
+
+        if action == "set_policy":
+            category = "policy"
+        elif action == "query_machine_state":
+            category = "query"
+        elif action == "stop_production":
+            category = "production_control"
+        elif action == "resume_production":
+            category = "production_control"
+        elif any(word in lower for word in ("chatter", "vibration", "resonance")):
+            category = "vibration"
+        elif any(word in lower for word in ("collision", "crash", "impact")):
+            category = "collision_risk"
+        elif any(word in lower for word in ("tool", "wear", "insert", "fixture", "clamp", "vise")):
+            category = "tooling"
+        elif any(word in lower for word in ("coolant", "heat", "temperature")):
+            category = "thermal"
+        elif any(word in lower for word in ("feed", "speed", "rpm")):
+            category = "process_parameters"
+
+        severity = "unknown"
+        if action == "abort" or re.search(r"\b(severe|critical|immediate|now)\b", lower):
+            severity = "high"
+        elif action in ("rework", "reduce_feed") or re.search(r"\b(moderate|warning|watch)\b", lower):
+            severity = "medium"
+        elif action == "continue" or re.search(r"\b(minor|small|resume|continue)\b", lower):
+            severity = "low"
+
+        location = "unspecified"
+        if re.search(r"\b(wall|edge|boundary|corner)\b", lower):
+            location = "boundary_region"
+        elif re.search(r"\b(center|middle)\b", lower):
+            location = "center_region"
+        elif re.search(r"\b(jaw|vise|fixture|clamp)\b", lower):
+            location = "workholding"
+
+        state = agent.get_state() if agent is not None else {}
+        machine_state = {
+            "status": state.get("status"),
+            "current_seed": state.get("current_seed"),
+            "current_section": state.get("current_section"),
+            "queue_depth": state.get("queue_depth"),
+        }
+
+        return {
+            "event_type": event_type,
+            "category": category,
+            "severity": severity,
+            "location": location,
+            "active_error": active_error,
+            "machine_state": machine_state,
+            "action": action or "",
+            "parameters": dict(params),
+        }
 
     # ── LLM ------------------------------------------------------------------
 
@@ -304,6 +588,10 @@ class FactoryAgent:
             f"Section  : {ctx.error_section}\n"
             f"G-code   : {ctx.error_gcode_line}\n"
             f"Tool life: {ctx.tool_life_pct:.1f}%\n"
+            + (
+                f"Operator context: {json.dumps(ctx.operator_context, sort_keys=True)}\n"
+                if ctx.operator_context else ""
+            )
         )
 
     def _call_openai(self, ctx: ErrorContext) -> list[LLMResponse]:
@@ -940,6 +1228,8 @@ class FactoryAgent:
             "scheduler":          self.scheduler.state_dict(),
             "agents":             [ag.get_state() for ag in self.agents],
             "rework_queue_depth": len(self.rework_queue),
+            "operator_feedback_log": list(self.operator_feedback_log),
+            "operator_context_by_machine": dict(self.operator_context_by_machine),
             "tool_inventory":     {tid: len(st)
                                    for tid, st in self.tool_inventory.items()},
             "kpis":               self.get_production_kpis(),
@@ -965,6 +1255,7 @@ class FactoryAgent:
             "total_jobs_completed":      self.total_jobs_completed,
             "total_errors_processed":    self.total_errors_processed,
             "total_tools_replaced":      self.total_tools_replaced,
+            "operator_interventions":    len(self.operator_feedback_log),
             "rework_queue_depth":        len(self.rework_queue),
             "avg_tool_life_pct":         round(avg_life, 1),
             "scheduler_queue_depth":     len(self.scheduler.job_queue),
@@ -985,7 +1276,8 @@ class FactoryAgent:
             f"{kpis['rework_queue_depth']} rework  "
             f"{kpis['scheduler_queue_depth']} queued",
             f"  Errors   : {kpis['total_errors_processed']} processed  "
-            f"  Tools replaced: {kpis['total_tools_replaced']}",
+            f"  Tools replaced: {kpis['total_tools_replaced']}  "
+            f"Operator notes: {kpis['operator_interventions']}",
             f"  Avg tool life : {kpis['avg_tool_life_pct']:.1f}%",
         ]
         for ag in self.agents:

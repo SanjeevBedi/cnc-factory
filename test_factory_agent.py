@@ -1,5 +1,5 @@
 """
-test_factory_agent.py — Phase 7 tests for factory_agent.py  (24 tests)
+test_factory_agent.py — Phase 7 tests for factory_agent.py  (27 tests)
 
  1. test_factory_created_with_agents
  2. test_shared_rework_queue
@@ -25,6 +25,9 @@ test_factory_agent.py — Phase 7 tests for factory_agent.py  (24 tests)
 22. test_summary_non_empty
 23. test_submit_new_seed_creates_job
 24. test_integration_full_factory_run
+25. test_operator_context_appended_to_error
+26. test_operator_override_applies_abort
+27. test_operator_feedback_visible_in_state
 """
 
 from __future__ import annotations
@@ -243,7 +246,7 @@ class TestFactoryAgent(unittest.TestCase):
             "machines_running","machines_idle",
             "machines_awaiting_factory","machines_stopped",
             "total_jobs_completed","total_errors_processed",
-            "total_tools_replaced","rework_queue_depth",
+            "total_tools_replaced","operator_interventions","rework_queue_depth",
             "avg_tool_life_pct","scheduler_queue_depth",
         ):
             self.assertIn(key, kpis, f"Missing KPI: {key!r}")
@@ -304,6 +307,164 @@ class TestFactoryAgent(unittest.TestCase):
         print("\n[integration] 5-tick run")
         print(fa.summary())
         print("KPIs:", fa.get_production_kpis())
+
+    # 25
+    def test_operator_context_appended_to_error(self):
+        fa = _factory()
+        ag = fa.agents[0]
+        ag.current_job = _job()
+        ag.inject_error("tool chatter detected")
+        rec = fa.handle_operator_input("M01", "Check vise clamp near jaw 2")
+        self.assertFalse(rec["applied"])
+        self.assertEqual(rec["context"]["event_type"], "operator_note")
+        self.assertEqual(rec["context"]["category"], "tooling")
+        self.assertEqual(rec["context"]["location"], "workholding")
+        self.assertIn("operator: Check vise clamp near jaw 2",
+                      ag.active_error.description)
+        self.assertEqual(ag.status, "awaiting_factory")
+
+    # 26
+    def test_operator_override_applies_abort(self):
+        fa = _factory()
+        ag = fa.agents[0]
+        ag.current_job = _job()
+        ag.inject_error("collision risk imminent")
+        rec = fa.handle_operator_input("M01", "Abort the job now")
+        self.assertTrue(rec["applied"])
+        self.assertEqual(rec["action"], "abort")
+        self.assertEqual(ag.status, "stopped")
+        self.assertIsNotNone(ag.active_error)
+        self.assertTrue(ag.active_error.resolved)
+
+    # 27
+    def test_operator_feedback_visible_in_state(self):
+        fa = _factory()
+        ag = fa.agents[0]
+        ag.current_job = _job()
+        ag.inject_error("vibration detected")
+        fa.handle_operator_input("M01", "Reduce feed to 65%")
+        state = fa.get_factory_state()
+        self.assertEqual(len(state["operator_feedback_log"]), 1)
+        self.assertEqual(state["operator_feedback_log"][0]["action"], "reduce_feed")
+        self.assertEqual(
+            state["operator_feedback_log"][0]["parameters"]["feed_override_pct"],
+            65.0,
+        )
+        self.assertEqual(
+            state["operator_feedback_log"][0]["context"]["event_type"],
+            "operator_override",
+        )
+        self.assertEqual(
+            state["operator_context_by_machine"]["M01"]["category"],
+            "process_parameters",
+        )
+        self.assertIsInstance(json.dumps(state), str)
+
+    def test_operator_context_included_in_error_prompt(self):
+        fa = _factory()
+        ag = fa.agents[0]
+        ag.current_job = _job()
+        ag.inject_error("chatter near wall")
+        fa.handle_operator_input("M01", "Severe chatter near wall")
+        ctx = fa._build_error_context(ag, tick_num=3)
+        prompt = fa._build_llm_prompt(ctx)
+        self.assertEqual(ctx.operator_context["category"], "vibration")
+        self.assertEqual(ctx.operator_context["severity"], "high")
+        self.assertIn("Operator context:", prompt)
+        self.assertIn('"category": "vibration"', prompt)
+
+    def test_operator_policy_directive_updates_scheduler_policy(self):
+        fa = _factory()
+        rec = fa.handle_operator_input("M01", "Switch scheduling policy to max tool life")
+        self.assertTrue(rec["applied"])
+        self.assertEqual(rec["action"], "set_policy")
+        self.assertEqual(rec["parameters"]["policy"], "max_tool_life")
+        self.assertEqual(rec["context"]["event_type"], "operator_directive")
+        self.assertEqual(rec["context"]["category"], "policy")
+        self.assertEqual(fa.policy, "max_tool_life")
+        self.assertEqual(fa.scheduler.policy, "max_tool_life")
+
+    def test_operator_policy_directive_visible_in_state(self):
+        fa = _factory()
+        fa.handle_operator_input("M02", "Optimize schedule for best finish policy")
+        state = fa.get_factory_state()
+        self.assertEqual(state["policy"], "best_finish")
+        self.assertEqual(
+            state["operator_feedback_log"][0]["parameters"]["policy"],
+            "best_finish",
+        )
+        self.assertEqual(
+            state["operator_context_by_machine"]["M02"]["event_type"],
+            "operator_directive",
+        )
+
+    def test_operator_policy_directive_accepts_multiobjective_alias(self):
+        fa = _factory()
+        rec = fa.handle_operator_input("M03", "Prioritize the multiobjective schedule")
+        self.assertTrue(rec["applied"])
+        self.assertEqual(rec["parameters"]["policy"], "multi_objective")
+        self.assertEqual(fa.scheduler.policy, "multi_objective")
+
+    def test_operator_state_query_returns_machine_snapshot(self):
+        fa = _factory()
+        m02 = fa.agents[1]
+        m02.current_job = _job(seed=7)
+        m02.status = "running"
+        rec = fa.handle_operator_input("M01", "What is the status of M02?")
+        self.assertTrue(rec["applied"])
+        self.assertEqual(rec["action"], "query_machine_state")
+        self.assertEqual(rec["parameters"]["machine_id"], "M02")
+        snapshot = rec["parameters"]["machine_state"]
+        self.assertEqual(snapshot["machine_id"], "M02")
+        self.assertEqual(snapshot["agent_status"], "running")
+        self.assertEqual(snapshot["current_job"], m02.current_job.job_id)
+        self.assertEqual(rec["context"]["category"], "query")
+
+    def test_operator_stop_production_stops_factory(self):
+        fa = _factory()
+        fa.scheduler.submit(_job(seed=10))
+        rec = fa.handle_operator_input("M01", "Stop production across the factory now")
+        self.assertTrue(rec["applied"])
+        self.assertEqual(rec["action"], "stop_production")
+        self.assertEqual(rec["context"]["category"], "production_control")
+        self.assertEqual(rec["parameters"]["machines"], ["M01", "M02", "M03", "M04"])
+        self.assertTrue(all(ag.status == "stopped" for ag in fa.agents))
+        self.assertTrue(all(m.status == "stopped" for m in fa.scheduler.machines))
+        fa.tick()
+        self.assertEqual(len(fa.scheduler.job_queue), 1)
+
+    def test_operator_resume_production_restarts_stopped_factory(self):
+        fa = _factory()
+        m02 = fa.agents[1]
+        m02.current_job = _job(seed=11)
+        m02.status = "running"
+        fa.scheduler.machines[1].current_job = m02.current_job
+        fa.scheduler.machines[1].status = "running"
+        fa.handle_operator_input("M01", "Stop production across the factory now")
+        rec = fa.handle_operator_input("M01", "Resume production across the factory")
+        self.assertTrue(rec["applied"])
+        self.assertEqual(rec["action"], "resume_production")
+        self.assertEqual(rec["context"]["category"], "production_control")
+        self.assertEqual(rec["parameters"]["machines"], ["M01", "M02", "M03", "M04"])
+        self.assertEqual(fa.agents[0].status, "idle")
+        self.assertEqual(fa.agents[1].status, "running")
+        self.assertEqual(fa.scheduler.machines[0].status, "idle")
+        self.assertEqual(fa.scheduler.machines[1].status, "running")
+
+    def test_operator_resume_production_visible_in_state(self):
+        fa = _factory()
+        fa.handle_operator_input("M01", "Stop production across the factory now")
+        fa.handle_operator_input("M01", "Restart production for the line")
+        state = fa.get_factory_state()
+        self.assertEqual(len(state["operator_feedback_log"]), 2)
+        self.assertEqual(
+            state["operator_feedback_log"][-1]["action"],
+            "resume_production",
+        )
+        self.assertEqual(
+            state["operator_feedback_log"][-1]["context"]["event_type"],
+            "operator_directive",
+        )
 
 
 if __name__ == "__main__":
