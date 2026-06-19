@@ -773,10 +773,34 @@ class FactoryPanel(ttk.Frame):
         tk.Label(pf, text="Policy:", bg=PNL, fg=DIM,
                  font=("Courier", 9)).pack(side="left", padx=4)
         self._policy_var = tk.StringVar(value="min_time")
-        policies = ["min_time", "min_cost", "best_finish", "max_tool_life"]
+        policies = [
+            "min_time",
+            "min_cost",
+            "best_finish",
+            "max_tool_life",
+            "multi_objective",
+        ]
         om = ttk.OptionMenu(pf, self._policy_var, "min_time", *policies,
                             command=self._on_policy)
         om.pack(side="left")
+
+        # factory chat
+        cf = tk.Frame(self, bg=PNL)
+        cf.pack(fill="x", padx=4, pady=(0, 4))
+        tk.Label(cf, text="Factory Chat:", bg=PNL, fg=DIM,
+                 font=("Courier", 9)).pack(side="left", padx=(4, 2))
+        self._chat_mid_var = tk.StringVar(value="M01")
+        mids = ["M01", "M02", "M03", "M04"]
+        ttk.OptionMenu(cf, self._chat_mid_var, "M01", *mids).pack(side="left")
+        self._chat_entry = tk.Entry(
+            cf, bg=ENTRY, fg=FG, insertbackground=FG, font=("Courier", 9),
+        )
+        self._chat_entry.pack(side="left", fill="x", expand=True, padx=4)
+        self._chat_entry.bind("<Return>", self._send_factory_chat)
+        tk.Button(
+            cf, text="Send", bg=ACCENT, fg="black", relief="flat", padx=8,
+            command=self._send_factory_chat,
+        ).pack(side="right", padx=(2, 4))
 
         # KPI grid
         kf = tk.Frame(self, bg=PNL)
@@ -909,6 +933,13 @@ class FactoryPanel(ttk.Frame):
         self._app.fa.policy    = val
         self._app.fa.scheduler.policy = val
         self.log(f"Policy → {val}", "ok")
+
+    def _send_factory_chat(self, _event=None) -> None:
+        text = self._chat_entry.get().strip()
+        if not text:
+            return
+        self._app.handle_operator_input(self._chat_mid_var.get(), text)
+        self._chat_entry.delete(0, "end")
 
 
 # ── Main application ──────────────────────────────────────────────────────────
@@ -2385,6 +2416,8 @@ class FactoryGUI(tk.Tk):
     # ── Misc ──────────────────────────────────────────────────────────────────
     def handle_operator_input(self, mid: str, text: str) -> None:
         record = self.fa.handle_operator_input(mid, text)
+        if record["applied"] and record["action"] == "set_policy":
+            self._fpanel._policy_var.set(self.fa.policy)
         agent = next((a for a in self.fa.agents if a.machine_id == mid), None)
         panel = self._panels.get(mid)
         if panel and agent is not None:
