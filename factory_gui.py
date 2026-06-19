@@ -780,8 +780,9 @@ class FactoryPanel(ttk.Frame):
             "max_tool_life",
             "multi_objective",
         ]
-        om = ttk.OptionMenu(pf, self._policy_var, "min_time", *policies,
-                            command=self._on_policy)
+        om = ttk.OptionMenu(
+            pf, self._policy_var, policies[0], *policies[1:], command=self._on_policy,
+        )
         om.pack(side="left")
 
         # factory chat
@@ -791,7 +792,9 @@ class FactoryPanel(ttk.Frame):
                  font=("Courier", 9)).pack(side="left", padx=(4, 2))
         self._chat_mid_var = tk.StringVar(value="M01")
         mids = ["M01", "M02", "M03", "M04"]
-        ttk.OptionMenu(cf, self._chat_mid_var, "M01", *mids).pack(side="left")
+        ttk.OptionMenu(
+            cf, self._chat_mid_var, mids[0], *mids[1:],
+        ).pack(side="left")
         self._chat_entry = tk.Entry(
             cf, bg=ENTRY, fg=FG, insertbackground=FG, font=("Courier", 9),
         )
@@ -934,7 +937,7 @@ class FactoryPanel(ttk.Frame):
         self._app.fa.scheduler.policy = val
         self.log(f"Policy → {val}", "ok")
 
-    def _send_factory_chat(self, _event=None) -> None:
+    def _send_factory_chat(self, event=None) -> None:
         text = self._chat_entry.get().strip()
         if not text:
             return
