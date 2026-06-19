@@ -163,6 +163,7 @@ class FactoryAgent:
         self.command_log: list[FactoryCommand] = []
         self.operator_feedback_log: list[dict] = []
         self.operator_context_by_machine: dict[str, dict] = {}
+        self.operator_stopped_machines: set[str] = set()
 
         self.total_errors_processed = 0
         self.total_tools_replaced   = 0
@@ -391,6 +392,9 @@ class FactoryAgent:
         if (re.search(r"\b(stop|halt|pause)\b", normalized)
                 and re.search(r"\b(factory|production|line|shop)\b", normalized)):
             return "stop_production", {}
+        if (re.search(r"\b(resume|restart|start|continue)\b", normalized)
+                and re.search(r"\b(factory|production|line|shop)\b", normalized)):
+            return "resume_production", {}
         target_match = re.search(r"\b(m\d{2})\b", text, re.IGNORECASE)
         target_machine_id = (
             target_match.group(1).upper()
@@ -472,8 +476,29 @@ class FactoryAgent:
                     agent.active_error.factory_response = "abort"
                     agent.active_error.resolved = True
                 agent.status = "stopped"
+            self.operator_stopped_machines = set(stopped)
             params["machines"] = stopped
             return True
+        if action == "resume_production":
+            resumed = []
+            for sched_machine in self.scheduler.machines:
+                if sched_machine.machine_id not in self.operator_stopped_machines:
+                    continue
+                sched_machine.status = (
+                    "running" if sched_machine.current_job is not None else "idle"
+                )
+                resumed.append(sched_machine.machine_id)
+            for agent in self.agents:
+                if agent.machine_id not in self.operator_stopped_machines:
+                    continue
+                if (agent.active_error is not None
+                        and agent.active_error.resolved
+                        and agent.active_error.factory_response == "abort"):
+                    agent.active_error = None
+                agent.status = "running" if agent.current_job is not None else "idle"
+            self.operator_stopped_machines.clear()
+            params["machines"] = resumed
+            return bool(resumed)
         return False
 
     @staticmethod
@@ -498,6 +523,8 @@ class FactoryAgent:
         elif action == "query_machine_state":
             category = "query"
         elif action == "stop_production":
+            category = "production_control"
+        elif action == "resume_production":
             category = "production_control"
         elif any(word in lower for word in ("chatter", "vibration", "resonance")):
             category = "vibration"

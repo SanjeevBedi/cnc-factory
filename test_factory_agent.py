@@ -433,6 +433,39 @@ class TestFactoryAgent(unittest.TestCase):
         fa.tick()
         self.assertEqual(len(fa.scheduler.job_queue), 1)
 
+    def test_operator_resume_production_restarts_stopped_factory(self):
+        fa = _factory()
+        m02 = fa.agents[1]
+        m02.current_job = _job(seed=11)
+        m02.status = "running"
+        fa.scheduler.machines[1].current_job = m02.current_job
+        fa.scheduler.machines[1].status = "running"
+        fa.handle_operator_input("M01", "Stop production across the factory now")
+        rec = fa.handle_operator_input("M01", "Resume production across the factory")
+        self.assertTrue(rec["applied"])
+        self.assertEqual(rec["action"], "resume_production")
+        self.assertEqual(rec["context"]["category"], "production_control")
+        self.assertEqual(rec["parameters"]["machines"], ["M01", "M02", "M03", "M04"])
+        self.assertEqual(fa.agents[0].status, "idle")
+        self.assertEqual(fa.agents[1].status, "running")
+        self.assertEqual(fa.scheduler.machines[0].status, "idle")
+        self.assertEqual(fa.scheduler.machines[1].status, "running")
+
+    def test_operator_resume_production_visible_in_state(self):
+        fa = _factory()
+        fa.handle_operator_input("M01", "Stop production across the factory now")
+        fa.handle_operator_input("M01", "Restart production for the line")
+        state = fa.get_factory_state()
+        self.assertEqual(len(state["operator_feedback_log"]), 2)
+        self.assertEqual(
+            state["operator_feedback_log"][-1]["action"],
+            "resume_production",
+        )
+        self.assertEqual(
+            state["operator_feedback_log"][-1]["context"]["event_type"],
+            "operator_directive",
+        )
+
 
 if __name__ == "__main__":
     loader = unittest.TestLoader()
