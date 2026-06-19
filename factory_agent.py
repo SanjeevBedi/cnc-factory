@@ -68,6 +68,7 @@ class ErrorContext:
     queue_depth:        int
     factory_policy:     str
     tick:               int
+    operator_context:   dict = field(default_factory=dict)
 
 
 @dataclass
@@ -157,6 +158,7 @@ class FactoryAgent:
         self._seed_inventory()
         self.command_log: list[FactoryCommand] = []
         self.operator_feedback_log: list[dict] = []
+        self.operator_context_by_machine: dict[str, dict] = {}
 
         self.total_errors_processed = 0
         self.total_tools_replaced   = 0
@@ -236,6 +238,17 @@ class FactoryAgent:
         clean_text = text.strip()
         active_error = bool(agent and agent.status == "awaiting_factory"
                             and agent.active_error is not None)
+        action: Optional[str] = None
+        params: dict = {}
+        if agent is not None and active_error:
+            action, params = self._parse_operator_override(clean_text)
+        context = self._build_operator_context(
+            agent,
+            clean_text,
+            active_error=active_error,
+            action=action,
+            params=params,
+        )
 
         record = {
             "machine_id": machine_id,
@@ -245,10 +258,13 @@ class FactoryAgent:
             "applied": False,
             "action": "",
             "parameters": {},
+            "context": context,
         }
 
+        if clean_text:
+            self.operator_context_by_machine[machine_id] = dict(context)
+
         if agent is not None and active_error:
-            action, params = self._parse_operator_override(clean_text)
             if action is not None:
                 agent.handle_factory_response({"action": action, **params})
                 record["applied"] = True
@@ -325,6 +341,9 @@ class FactoryAgent:
             queue_depth        = state["queue_depth"],
             factory_policy     = self.policy,
             tick               = tick_num,
+            operator_context   = dict(
+                self.operator_context_by_machine.get(agent.machine_id, {})
+            ),
         )
 
     @staticmethod
@@ -345,6 +364,63 @@ class FactoryAgent:
             return "continue", {}
         return None, {}
 
+    @staticmethod
+    def _build_operator_context(
+        agent: Optional[CncAgent],
+        text: str,
+        *,
+        active_error: bool,
+        action: Optional[str],
+        params: dict,
+    ) -> dict:
+        lower = text.lower()
+        category = "general"
+        if any(word in lower for word in ("chatter", "vibration", "resonance")):
+            category = "vibration"
+        elif any(word in lower for word in ("collision", "crash", "impact")):
+            category = "collision_risk"
+        elif any(word in lower for word in ("tool", "wear", "insert", "fixture", "clamp", "vise")):
+            category = "tooling"
+        elif any(word in lower for word in ("coolant", "heat", "temperature")):
+            category = "thermal"
+        elif any(word in lower for word in ("feed", "speed", "rpm")):
+            category = "process_parameters"
+
+        severity = "unknown"
+        if action == "abort" or re.search(r"\b(severe|critical|immediate|now)\b", lower):
+            severity = "high"
+        elif action in ("rework", "reduce_feed") or re.search(r"\b(moderate|warning|watch)\b", lower):
+            severity = "medium"
+        elif action == "continue" or re.search(r"\b(minor|small|resume|continue)\b", lower):
+            severity = "low"
+
+        location = "unspecified"
+        if re.search(r"\b(wall|edge|boundary|corner)\b", lower):
+            location = "boundary_region"
+        elif re.search(r"\b(center|middle)\b", lower):
+            location = "center_region"
+        elif re.search(r"\b(jaw|vise|fixture|clamp)\b", lower):
+            location = "workholding"
+
+        state = agent.get_state() if agent is not None else {}
+        machine_state = {
+            "status": state.get("status"),
+            "current_seed": state.get("current_seed"),
+            "current_section": state.get("current_section"),
+            "queue_depth": state.get("queue_depth"),
+        }
+
+        return {
+            "event_type": "operator_override" if action is not None else "operator_note",
+            "category": category,
+            "severity": severity,
+            "location": location,
+            "active_error": active_error,
+            "machine_state": machine_state,
+            "action": action or "",
+            "parameters": dict(params),
+        }
+
     # ── LLM ------------------------------------------------------------------
 
     def _build_llm_prompt(self, ctx: ErrorContext) -> str:
@@ -361,6 +437,10 @@ class FactoryAgent:
             f"Section  : {ctx.error_section}\n"
             f"G-code   : {ctx.error_gcode_line}\n"
             f"Tool life: {ctx.tool_life_pct:.1f}%\n"
+            + (
+                f"Operator context: {json.dumps(ctx.operator_context, sort_keys=True)}\n"
+                if ctx.operator_context else ""
+            )
         )
 
     def _call_openai(self, ctx: ErrorContext) -> list[LLMResponse]:
@@ -998,6 +1078,7 @@ class FactoryAgent:
             "agents":             [ag.get_state() for ag in self.agents],
             "rework_queue_depth": len(self.rework_queue),
             "operator_feedback_log": list(self.operator_feedback_log),
+            "operator_context_by_machine": dict(self.operator_context_by_machine),
             "tool_inventory":     {tid: len(st)
                                    for tid, st in self.tool_inventory.items()},
             "kpis":               self.get_production_kpis(),

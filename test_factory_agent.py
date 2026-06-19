@@ -316,6 +316,9 @@ class TestFactoryAgent(unittest.TestCase):
         ag.inject_error("tool chatter detected")
         rec = fa.handle_operator_input("M01", "Check vise clamp near jaw 2")
         self.assertFalse(rec["applied"])
+        self.assertEqual(rec["context"]["event_type"], "operator_note")
+        self.assertEqual(rec["context"]["category"], "tooling")
+        self.assertEqual(rec["context"]["location"], "workholding")
         self.assertIn("operator: Check vise clamp near jaw 2",
                       ag.active_error.description)
         self.assertEqual(ag.status, "awaiting_factory")
@@ -347,7 +350,28 @@ class TestFactoryAgent(unittest.TestCase):
             state["operator_feedback_log"][0]["parameters"]["feed_override_pct"],
             65.0,
         )
+        self.assertEqual(
+            state["operator_feedback_log"][0]["context"]["event_type"],
+            "operator_override",
+        )
+        self.assertEqual(
+            state["operator_context_by_machine"]["M01"]["category"],
+            "process_parameters",
+        )
         self.assertIsInstance(json.dumps(state), str)
+
+    def test_operator_context_included_in_error_prompt(self):
+        fa = _factory()
+        ag = fa.agents[0]
+        ag.current_job = _job()
+        ag.inject_error("chatter near wall")
+        fa.handle_operator_input("M01", "Severe chatter near wall")
+        ctx = fa._build_error_context(ag, tick_num=3)
+        prompt = fa._build_llm_prompt(ctx)
+        self.assertEqual(ctx.operator_context["category"], "vibration")
+        self.assertEqual(ctx.operator_context["severity"], "high")
+        self.assertIn("Operator context:", prompt)
+        self.assertIn('"category": "vibration"', prompt)
 
 
 if __name__ == "__main__":
