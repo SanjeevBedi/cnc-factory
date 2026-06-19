@@ -407,9 +407,9 @@ class TestFactoryAgent(unittest.TestCase):
 
     def test_operator_state_query_returns_machine_snapshot(self):
         fa = _factory()
-        ag = fa.agents[1]
-        ag.current_job = _job(seed=7)
-        ag.status = "running"
+        m02 = fa.agents[1]
+        m02.current_job = _job(seed=7)
+        m02.status = "running"
         rec = fa.handle_operator_input("M01", "What is the status of M02?")
         self.assertTrue(rec["applied"])
         self.assertEqual(rec["action"], "query_machine_state")
@@ -417,7 +417,7 @@ class TestFactoryAgent(unittest.TestCase):
         snapshot = rec["parameters"]["machine_state"]
         self.assertEqual(snapshot["machine_id"], "M02")
         self.assertEqual(snapshot["agent_status"], "running")
-        self.assertEqual(snapshot["current_job"], ag.current_job.job_id)
+        self.assertEqual(snapshot["current_job"], m02.current_job.job_id)
         self.assertEqual(rec["context"]["category"], "query")
 
     def test_operator_stop_production_stops_factory(self):

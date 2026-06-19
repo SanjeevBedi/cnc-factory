@@ -398,8 +398,7 @@ class FactoryAgent:
         )
         if (target_machine_id
                 and re.search(r"\b(status|state|queue|summary|report)\b", normalized)
-                and re.search(r"\b(show|what(?:'s| is)?|query|report|state|status)\b",
-                              normalized)):
+                and re.search(r"\b(show|what(?:'s| is)?|query)\b", normalized)):
             return "query_machine_state", {"machine_id": target_machine_id}
         if not re.search(
             r"\b(policy|schedule|scheduling|prioriti[sz]e|optimi[sz]e|focus)\b",
