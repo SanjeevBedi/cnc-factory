@@ -2047,10 +2047,12 @@ class FactoryGUI(tk.Tk):
             panel = self._panels[machine_id]
             if panel._chat is None or not panel._chat.winfo_exists():
                 panel._open_chat()
-            panel._chat.append(machine_id,
-                f"SAFETY CRITICAL: {description}", "error")
-            panel._chat.append("Factory",
-                f"Emergency stop dispatched to {machine_id}", "factory")
+            panel._chat.append(
+                "error", f"{machine_id}: SAFETY CRITICAL: {description}"
+            )
+            panel._chat.append(
+                "factory", f"Emergency stop dispatched to {machine_id}"
+            )
             ag.handle_factory_response({"action": "emergency_stop"})
             self._eq.put(
                 GuiEvent("machine_update", machine_id, ag.get_state()))
@@ -2070,7 +2072,7 @@ class FactoryGUI(tk.Tk):
         if panel._chat is None or not panel._chat.winfo_exists():
             panel._open_chat()
         cw = panel._chat
-        cw.append(machine_id, f"DISTURBANCE → {description}", "error")
+        cw.append("error", f"{machine_id}: DISTURBANCE -> {description}")
         self._fpanel.log(
             f"{machine_id}: [{spec_key or 'generic'}] "
             f"{description[:60]}", "error")
